@@ -1,0 +1,35 @@
+Function Get-CertFromThumbprintFast {
+    [cmdletbinding()]
+    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2])]
+    param(
+        [Parameter(Mandatory=$True)]
+        [ValidateScript({
+            If ($_ -match '[^a-fA-F0-9]'){
+                throw "Invalid certificate thumbprint: $($_), has hidden characters"
+            }elseif($_.Length -ne 40){
+                throw "Invalid certificate thumbprint: $($_), must be 40 characters"
+            }  
+            $true
+        })]
+        [ValidateNotNullOrEmpty()]
+        [string]$CertificateThumbPrint,
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("Cert:\LocalMachine\My","Cert:\LocalMachine\WebHosting","My","WebHosting")]
+        [string]$CertStoreLocation = "WebHosting"
+    )
+
+    [System.Security.Cryptography.X509Certificates.X509Store]$certStore = New-Object System.Security.Cryptography.X509Certificates.X509Store(
+        $CertStoreLocation, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine )
+
+    $certStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+
+    [System.Security.Cryptography.X509Certificates.X509Certificate2Collection] $CertCollection =  $certStore.Certificates.Find(
+        [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $CertificateThumbPrint, $false)
+        
+     $certStore.Close()
+
+     If ($null -eq $certCollection){
+        throw "Error: No certificate found containing thumbprint: $($CertificateThumbPrint)"
+     }
+     return $certCollection
+}
