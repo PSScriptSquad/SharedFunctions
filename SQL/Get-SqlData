@@ -1,0 +1,55 @@
+function Get-SqlData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SQLServer,
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SQLDBName,
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SqlQuery,
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [System.Management.Automation.Credential()]
+        [System.Management.Automation.PSCredential]$Credential
+    ) 
+    begin{
+        # declaration
+        $DataTable = New-Object System.Data.DataTable
+
+        #Create connection object to SQL instance if one isn't already open
+        if ($SQLConnection.State -ne [Data.ConnectionState]::Open) {
+                    
+            if ($null -eq $Credential){
+                $SQLConnection = New-Object System.Data.SqlClient.SqlConnection                    
+                $SQLConnection.ConnectionString = "server = '$SQLServer'; database = '$SQLDBName'; Integrated Security = True;"                    
+            }Else{
+                #set the password as read only
+                $Credential.Password.MakeReadOnly()
+
+                # Create the SqlCredential object
+                $sqlCred = New-Object System.Data.SqlClient.SqlCredential($Credential.username,$Credential.password)
+                $SqlConnection.ConnectionString = "Server = $SQLServer; Database = $SQLDBName;"
+                $SqlConnection.Credential = $sqlCred 
+            }
+            try {
+                $SQLConnection.Open()
+            } catch {
+                Throw "Connection to SQL DB not open: $($_.Exception.Message)"
+            }
+        }
+    }
+    Process{ 
+        $Command = New-Object System.Data.SQLClient.SQLCommand
+        $Command.Connection = $SQLConnection
+        $Command.CommandText = $SqlQuery
+        $Reader = $Command.ExecuteReader()
+        $DataTable.Load($Reader)
+    }
+    End{
+        $SQLConnection.Close()
+        return $DataTable
+    }
+}
