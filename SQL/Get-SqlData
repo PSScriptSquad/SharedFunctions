@@ -3,53 +3,61 @@ function Get-SqlData {
     param(
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
-        [string]$SQLServer,
+        [string]$SQLServer,                # SQL Server name or IP address
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
-        [string]$SQLDBName,
+        [string]$SQLDBName,                # Database name
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
-        [string]$SqlQuery,
+        [string]$SqlQuery,                 # SQL query to execute
         [Parameter(Mandatory=$false)]
-        [ValidateNotNullOrEmpty()]
         [System.Management.Automation.Credential()]
-        [System.Management.Automation.PSCredential]$Credential
+        [System.Management.Automation.PSCredential]$Credential  # Optional credential for SQL authentication
     ) 
     begin{
-        # declaration
-        $DataTable = New-Object System.Data.DataTable
+        try {
+            # Initialize a new DataTable object to store query results
+            $DataTable = New-Object System.Data.DataTable
+            
+            # Create a connection to the SQL Server instance if one isn't already open
+            $SQLConnection = New-Object System.Data.SqlClient.SqlConnection
+            $SQLConnection.ConnectionString = "Server = $SQLServer; Database = $SQLDBName;"
 
-        #Create connection object to SQL instance if one isn't already open
-        if ($SQLConnection.State -ne [Data.ConnectionState]::Open) {
-                    
-            if ($null -eq $Credential){
-                $SQLConnection = New-Object System.Data.SqlClient.SqlConnection                    
-                $SQLConnection.ConnectionString = "server = '$SQLServer'; database = '$SQLDBName'; Integrated Security = True;"                    
-            }Else{
-                #set the password as read only
-                $Credential.Password.MakeReadOnly()
+            if ($Credential) {
+                # If credentials provided, use SQL Server authentication
+                $sqlCred = $Credential.GetNetworkCredential()
+                $SQLConnection.Credential = $sqlCred
+            } else {
+                # Use Windows authentication
+                $SQLConnection.ConnectionString += "Integrated Security = True;"
+            }
 
-                # Create the SqlCredential object
-                $sqlCred = New-Object System.Data.SqlClient.SqlCredential($Credential.username,$Credential.password)
-                $SqlConnection.ConnectionString = "Server = $SQLServer; Database = $SQLDBName;"
-                $SqlConnection.Credential = $sqlCred 
-            }
-            try {
-                $SQLConnection.Open()
-            } catch {
-                Throw "Connection to SQL DB not open: $($_.Exception.Message)"
-            }
+            # Open the SQL connection
+            $SQLConnection.Open()
+        } catch {
+            # Throw an error if connection fails
+            Throw "Failed to connect to SQL Server '$SQLServer' with database '$SQLDBName': $($_.Exception.Message)"
         }
     }
     Process{ 
-        $Command = New-Object System.Data.SQLClient.SQLCommand
-        $Command.Connection = $SQLConnection
-        $Command.CommandText = $SqlQuery
-        $Reader = $Command.ExecuteReader()
-        $DataTable.Load($Reader)
+        try {
+            # Execute the SQL query and store the results in $DataTable
+            $Command = New-Object System.Data.SqlClient.SqlCommand
+            $Command.Connection = $SQLConnection
+            $Command.CommandText = $SqlQuery
+            $Reader = $Command.ExecuteReader()
+            $DataTable.Load($Reader)
+        } catch {
+            Throw "Failed to execute SQL query: $SqlQuery. Error: $($_.Exception.Message)"
+        }
     }
     End{
-        $SQLConnection.Close()
-        return $DataTable
+        try {
+            # Close the SQL connection and return the populated DataTable
+            $SQLConnection.Close()
+            return $DataTable
+        } catch {
+            Throw "Failed to close SQL connection: $($_.Exception.Message)"
+        }
     }
 }
