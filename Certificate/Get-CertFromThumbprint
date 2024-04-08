@@ -1,6 +1,6 @@
-Function Get-CertFromThumbprintFast {
-    [cmdletbinding()]
-    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2])]
+Function Get-CertFromThumbprint {
+    [CmdletBinding()]
+    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
     param(
         [Parameter(Mandatory=$True)]
         [ValidateScript({
@@ -13,23 +13,31 @@ Function Get-CertFromThumbprintFast {
         })]
         [ValidateNotNullOrEmpty()]
         [string]$CertificateThumbPrint,
+
         [Parameter(Mandatory=$false)]
         [ValidateSet("Cert:\LocalMachine\My","Cert:\LocalMachine\WebHosting","My","WebHosting")]
         [string]$CertStoreLocation = "WebHosting"
     )
 
-    [System.Security.Cryptography.X509Certificates.X509Store]$certStore = New-Object System.Security.Cryptography.X509Certificates.X509Store(
+    # Open the certificate store
+    $CertStore = New-Object System.Security.Cryptography.X509Certificates.X509Store(
         $CertStoreLocation, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine )
+    try {
+        $CertStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+    } catch {
+        throw "Error opening certificate store: $_"
+    }
 
-    $certStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
-
-    [System.Security.Cryptography.X509Certificates.X509Certificate2Collection] $CertCollection =  $certStore.Certificates.Find(
+    # Find the certificate by thumbprint
+    $CertCollection = $CertStore.Certificates.Find(
         [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $CertificateThumbPrint, $false)
-        
-     $certStore.Close()
 
-     If ($null -eq $certCollection){
+    $CertStore.Close()
+
+    # Check if certificate(s) found
+    If ($CertCollection.Count -eq 0){
         throw "Error: No certificate found containing thumbprint: $($CertificateThumbPrint)"
-     }
-     return $certCollection
+    }
+    
+    return $CertCollection
 }
