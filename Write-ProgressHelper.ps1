@@ -12,15 +12,17 @@ function Write-ProgressHelper {
             The total count of items.
         .PARAMETER Activity
             The activity description to display in the progress bar.
+        .PARAMETER CurrentOperation
+            The description of the current operation to display in the progress bar.
         .EXAMPLE
-            Write-ProgressHelper -i 10 -TotalCount 100 -Activity "Processing Files"
-            This command displays progress for processing files where 10 files are processed out of 100.
+            Write-ProgressHelper -i 10 -TotalCount 100 -Activity "Processing Files" -CurrentOperation "Copying File1"
+            This command displays progress for processing files where 10 files are processed out of 100, with the current operation "Copying File1".
         .NOTES
             Name: Write-ProgressHelper
             Author: Ryan Whitlock
             Date: 06.29.2023
-            Version: 1.0
-            Changes: Added comments, improved clarity and readability.
+            Version: 1.1
+            Changes: Added Parameter for CurrentOperation
     #>
     [CmdletBinding()]
     param(
@@ -29,7 +31,9 @@ function Write-ProgressHelper {
         [Parameter(Mandatory=$true)]
         [int]$TotalCount,
         [Parameter(Mandatory=$true)]
-        [string]$Activity
+        [string]$Activity,
+        [Parameter(Mandatory=$false)]
+        [string]$CurrentOperation = ""
     )
 
     # Check if the window width has changed
@@ -45,7 +49,7 @@ function Write-ProgressHelper {
 
     # Update progress only if the window width has changed or progress has been updated
     if ($WindowWidthChanged -or $ProgressCompleted -ne $LastProgressCompleted) {
-        Write-Progress -activity $Activity -status "Grouped: $i of $($TotalCount)" -percentComplete (($i / $TotalCount) * 100) 
+       Write-Progress -activity $Activity -status "Grouped: $i of $($TotalCount)" -percentComplete (($i / $TotalCount) * 100) -CurrentOperation $CurrentOperation
     }
 
     # Store last progress completed for comparison
