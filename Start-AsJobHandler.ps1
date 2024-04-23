@@ -1,9 +1,9 @@
 Function Start-AsJobHandler {
     <#
       .SYNOPSIS
-          Start-AsJobHandler asynchronously executes commands on multiple systems as PowerShell jobs.
+          Start-AsJobHandler asynchronously receives jobs from Invoke-Command.
       .DESCRIPTION
-          Start-AsJobHandler executes PowerShell commands on multiple systems using PowerShell jobs. It provides progress indication and collects results from the jobs. If any job fails, it gathers error information. 
+          Start-AsJobHandler asynchronously receives jobs from Invoke-Command. It provides progress indication and collects results from the jobs. If any job fails, it gathers error information. 
           After completion, it returns responding and non-responding systems along with their output or error messages.
       .PARAMETER ProgressBarMsg
           Specifies the message to display in the progress bar. Default is "Collecting Data...".
