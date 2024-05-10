@@ -1,4 +1,30 @@
 function Get-SqlData {
+    <#
+        .SYNOPSIS
+            This function retrieves data from a SQL Server database using the provided SQL query.
+        .DESCRIPTION
+            The Get-SqlData function establishes a connection to a SQL Server database and executes the provided SQL query. 
+            It returns the query results in the form of a DataTable object.
+            The function supports both Windows and SQL Server authentication.
+            This function is useful for querying data from SQL Server within PowerShell scripts.
+        .PARAMETER SQLServer
+            Specifies the name or IP address of the SQL Server instance.
+        .PARAMETER SQLDBName
+            Specifies the name of the SQL database.
+        .PARAMETER SqlQuery
+            Specifies the SQL query to execute.
+        .PARAMETER Credential
+            Specifies optional credentials for SQL Server authentication.
+        .EXAMPLE
+            $result = Get-SqlData -SQLServer "localhost" -SQLDBName "TestDB" -SqlQuery "SELECT * FROM Employees" -Credential (Get-Credential)
+            Retrieves all records from the Employees table in the TestDB database located on the local SQL Server instance using provided credentials.
+        .NOTES
+            Name: Get-SqlData
+            Author: Ryan Whitlock
+            Date: 11.30.2023
+            Version: 1.1
+            Changes: Added comments, improved clarity and readability.
+    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)]
