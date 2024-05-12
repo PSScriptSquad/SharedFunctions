@@ -1,4 +1,28 @@
 Function Import-cert {
+    <#
+        .SYNOPSIS
+            Imports the newest certificate files from a specified directory into the local machine's certificate store.        
+        .DESCRIPTION
+            This function imports certificate files from a specified directory into the local machine's certificate store. 
+            It searches for certificate files based on a naming convention where certificates are named with their expiration date.
+                convention: [CertificateName]_[ExpirationDate].
+            It selects the newest certificate for each unique certificate name and imports it into the appropriate certificate store. 
+            This function can handle both certificates with and without private keys.
+            This function assumes that certificate files are located in "C:\temp\CertExport_DontManuallyUpdate" directory.
+            Certificate files with private keys should be password-protected.
+            Imported certificates are stored in the LocalMachine certificate store.
+        .PARAMETER Password
+            Specifies the password used to protect the private key of the certificates. Default value is 'abc123'.        
+        .EXAMPLE
+            Import-Cert -Password 'mypassword'
+            Imports certificate files from the default directory "C:\temp\CertExport_DontManuallyUpdate" using the specified password 'mypassword'.        
+        .NOTES
+            Name: Import-cert
+            Author: Ryan Whitlock
+            Date: 12.04.2023
+            Version: 1.1
+            Changes: Added comments, improved clarity and readability.
+    #>
     param(
         [Parameter(Mandatory=$false,Position=0)]
         [String]$Password = 'abc123'
@@ -8,7 +32,7 @@ Function Import-cert {
     $SecurePassword = ConvertTo-SecureString -String $Password -Force -AsPlainText
     
     # Get certificate files from the specified directory
-    $CertFiles = Get-ChildItem "C:\temp\T1CertExport_DontManuallyUpdate" -Recurse | Where-Object { -not $_.PSIsContainer }
+    $CertFiles = Get-ChildItem "C:\temp\CertExport_DontManuallyUpdate" -Recurse | Where-Object { -not $_.PSIsContainer }
 
     # Extract certificate data from each file
     $CertData = foreach ($File in $CertFiles) {
