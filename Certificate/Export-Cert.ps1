@@ -1,4 +1,31 @@
 Function Export-Cert {
+    <#
+        .SYNOPSIS
+            Export certificates with various conditions.        
+        .DESCRIPTION
+            This function exports certificates based on specified conditions, such as whether the certificate has a private key,
+            the certificate's expiration date, and the destination path. It exports certificates as either PFX or CER files,
+            depending on the conditions.        
+        .PARAMETER Cert
+            The certificate to be exported.        
+        .PARAMETER ChildPath
+            The destination path for the exported certificate.        
+        .PARAMETER HasPrivateKey
+            Specifies whether the certificate has a private key.        
+        .PARAMETER Password
+            The password to protect the exported PFX file. Default is 'abc123'.        
+        .EXAMPLE
+            Export-Cert -Cert $certObject -ChildPath "webhosting" -HasPrivateKey $true
+        
+            This example exports the certificate specified by $certObject to the "webhosting" directory. 
+            If the certificate has a private key and meets other specified conditions, it's exported as a PFX file.        
+        .NOTES
+            Name: Export-Cert
+            Author: Ryan Whitlock
+            Date: 12.13.2023
+            Version: 1.1
+            Changes: Added comments, improved clarity and readability.
+    #>
     param(
         [Parameter(Mandatory=$true, Position = 0)]
         [ValidateNotNullOrEmpty()]
@@ -25,7 +52,7 @@ Function Export-Cert {
     # Convert password to secure string
     $SecurePassword = ConvertTo-SecureString -String $Password -Force -AsPlainText
     # Construct the output directory path
-    $MyPath = Join-Path -Path "C:\temp\T1CertExport_DontManuallyUpdate\" -ChildPath $ChildPath
+    $MyPath = Join-Path -Path "C:\temp\CertExport_DontManuallyUpdate\" -ChildPath $ChildPath
     $Date = Get-Date
 
     # Create an X509 chain object
