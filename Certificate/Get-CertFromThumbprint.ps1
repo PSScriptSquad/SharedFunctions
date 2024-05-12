@@ -1,4 +1,26 @@
 Function Get-CertFromThumbprint {
+    <#
+        .SYNOPSIS
+            Retrieves certificate(s) from the certificate store by thumbprint.
+        .DESCRIPTION
+            This function retrieves certificate(s) from the certificate store by thumbprint.
+            It searches for the specified thumbprint in the given certificate store location.
+            If the thumbprint is found, it returns the certificate(s); otherwise, it throws an error.        
+        .PARAMETER CertificateThumbPrint
+            Specifies the thumbprint of the certificate to retrieve. It should be a hexadecimal string of 40 characters.        
+        .PARAMETER CertStoreLocation
+            Specifies the location of the certificate store.
+            Default value is "WebHosting". Available options are "Cert:\LocalMachine\My", "Cert:\LocalMachine\WebHosting", "My", "WebHosting".        
+        .EXAMPLE
+            Get-CertFromThumbprint -CertificateThumbPrint "3E4F6E6A9F69..." -CertStoreLocation "WebHosting"
+            Retrieves the certificate(s) with the specified thumbprint from the "WebHosting" certificate store.        
+        .NOTES
+            Name: Execute-Command 
+            Author: Ryan Whitlock
+            Date: 12.13.2023
+            Version: 1.1
+            Changes: Added comments, improved clarity and readability.
+    #>
     [CmdletBinding()]
     [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
     param(
