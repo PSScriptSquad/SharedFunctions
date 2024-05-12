@@ -1,4 +1,23 @@
 Function Get-MatchingFiles {
+    <#
+        .SYNOPSIS
+            Compares two directories and returns a list of matching files.
+        .DESCRIPTION
+            This function compares the contents of two directories specified by PathA and PathB. It finds files with the same name and size in both directories and returns a list of these matching files.
+        .PARAMETER PathA
+            Specifies the path to the first directory.
+        .PARAMETER PathB
+            Specifies the path to the second directory.
+        .EXAMPLE
+            Get-MatchingFiles -PathA "C:\Folder1" -PathB "D:\Folder2"
+            This example compares the contents of Folder1 and Folder2 and returns a list of files with the same name and size.
+        .NOTES
+            Name: Get-MatchingFiles
+            Author: Ryan Whitlock
+            Date: 06.01.2023
+            Version: 1.1
+            Changes: Added comments, improved clarity and readability.
+    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true, Position=0)]
