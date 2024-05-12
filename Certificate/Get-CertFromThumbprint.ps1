@@ -15,7 +15,7 @@ Function Get-CertFromThumbprint {
             Get-CertFromThumbprint -CertificateThumbPrint "3E4F6E6A9F69..." -CertStoreLocation "WebHosting"
             Retrieves the certificate(s) with the specified thumbprint from the "WebHosting" certificate store.        
         .NOTES
-            Name: Execute-Command 
+            Name: Get-CertFromThumbprint
             Author: Ryan Whitlock
             Date: 12.13.2023
             Version: 1.1
