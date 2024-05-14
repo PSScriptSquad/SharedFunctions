@@ -43,7 +43,7 @@ Function Start-AsJobHandler {
             Start-Sleep -Seconds 1 
         }   
     }
-    Write-Progress -Activity $ProgressBarMsg -Status "Completed." -Completed
+    Write-Progress -Activity $ProgressBarMessage -Status "Completed." -Completed
 
     # Collect job data and handle errors
     $notRespondingSystems = @()
