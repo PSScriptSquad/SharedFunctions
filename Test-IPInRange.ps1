@@ -39,15 +39,13 @@ function Test-IPInRange {
 
         # CIDR range parameter set.
         [parameter(Mandatory, Position=1, ParameterSetName='CIDR')]
-        [validatescript({
-            $IP   = ($_ -split '/')[0]
-            $Bits = ($_ -split '/')[1]
-            (([System.Net.IPAddress]($IP)).AddressFamily -eq 'InterNetwork')
-            if (-not($Bits)) {
-                throw 'Missing CIDR notation.'
-            } elseif (-not(0..32 -contains [int]$Bits)) {
-                throw 'Invalid CIDR notation. The valid bit range is 0 to 32.'
+        [ValidateScript( {
+            if (-not ([System.Net.IPAddress]::TryParse($_, [ref]$null) -and 
+                      [System.Net.IPAddress]$_ -is [System.Net.IPAddress] -and 
+                      ([System.Net.IPAddress]$_).AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork)) {
+                Throw "$($_) does not appear to be a valid IPv4 address"
             }
+            $true
         })]
         [string]
         $CIDR,
