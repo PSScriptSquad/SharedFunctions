@@ -13,19 +13,27 @@ function Include-AdditionalScripts {
         .NOTES
             Author: Ryan Whitlock
             Date: 06.20.2024
-            Version: 1.0
-            Changes: Initial release
+            Version: 1.1
+            Changes: Cleaned up code and added comments.
     #>
      param (
         [string[]]$ScriptFileNames
     )
 
-    # Check the current environment and include script files accordingly
-    if ($psISE){
-        (Get-ChildItem (Join-Path (Split-Path $psISE.CurrentFile.FullPath) Functions) -Recurse -Include $ScriptFileNames) | ForEach-Object {. $_.FullName}
-    }elseif($env:TERM_PROGRAM -eq 'vscode'){
-        (Get-ChildItem (Join-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('.\') Functions) -Recurse -Include $ScriptFileNames) | ForEach-Object {. $_.FullName}
-    }else{
-        (Get-ChildItem (Join-Path $PSScriptRoot Functions) -Recurse -Include $ScriptFileNames) | ForEach-Object {. $_.FullName}
+    # Determine the base path for the Functions directory
+    $basePath = if ($psISE) {
+        Split-Path $psISE.CurrentFile.FullPath
+    } elseif ($env:TERM_PROGRAM -eq 'vscode') {
+        $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('.\')
+    } else {
+        $PSScriptRoot
+    }
+
+    # Join the base path with the Functions directory
+    $functionsPath = Join-Path -Path $basePath -ChildPath 'Functions'
+
+    # Get the script files and include them
+    Get-ChildItem -Path $functionsPath -Recurse -Include $ScriptFileNames | ForEach-Object {
+        . $_.FullName
     }
 }
