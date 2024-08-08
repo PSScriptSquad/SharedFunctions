@@ -4,7 +4,7 @@ function Get-Servers {
         Retrieves servers via LDAP within specified organizational units (OUs).
 
     .DESCRIPTION
-        This function queries Active Directory to find LDAP servers within the specified OUs. 
+        This function queries Active Directory to find servers within the specified OUs. 
         It constructs an LDAP filter based on the provided OUs and searches for servers matching the criteria. 
         If no OUs are specified, it searches across the entire directory. 
         This function does not require the Remote Server Administration Tools (RSAT) and is optimized for fast execution.
@@ -14,12 +14,12 @@ function Get-Servers {
         naming context of the RootDSE.
 
     .PARAMETER OU
-        An array of organizational units to search for LDAP servers. This parameter is optional
+        An array of organizational units to search for servers. This parameter is optional
         and only accepts alphabetic characters and spaces.
 
     .EXAMPLE
-        Get-LDAPServers -OU "Sales", "Marketing"
-        Get-LDAPServers
+        Get-Servers -OU "Sales", "Marketing"
+        Get-Servers
 
     .NOTES
         Name: Get-Servers
