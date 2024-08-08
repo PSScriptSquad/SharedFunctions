@@ -19,7 +19,7 @@ function Add-GroupMember {
         Add-Group -ComputerName "MyComputer" -GroupList "Group1,Group2,Group3"    
         This will add the computer "MyComputer" to the groups "Group1", "Group2", and "Group3".
 
-    .NOTE
+    .NOTES
         Name: Add-GroupMember
         Author: Ryan Whitlock
         Date: 08.07.2024
