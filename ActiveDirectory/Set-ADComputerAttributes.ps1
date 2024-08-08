@@ -30,7 +30,7 @@ function Set-ADComputerAttributes {
     
         Set-ADComputerAttributes -ComputerName "PC001" -ADAttributes $ADAttributes
 
-    .NOTE
+    .NOTES
         Name: Set-ADComputerAttributes
         Author: Ryan Whitlock
         Date: 08.07.2024
