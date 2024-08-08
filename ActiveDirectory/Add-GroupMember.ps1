@@ -1,4 +1,4 @@
-function Add-Group {
+function Add-GroupMember {
     <#
     .SYNOPSIS
         Adds a computer to multiple Active Directory groups.
