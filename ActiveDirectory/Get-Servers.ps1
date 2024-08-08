@@ -1,7 +1,7 @@
 function Get-Servers {
     <#
     .SYNOPSIS
-        Retrieves LDAP servers within specified organizational units (OUs).
+        Retrieves servers via LDAP within specified organizational units (OUs).
 
     .DESCRIPTION
         This function queries Active Directory to find LDAP servers within the specified OUs. 
