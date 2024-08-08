@@ -16,8 +16,7 @@ function Add-GroupMember {
         A comma-separated list of Active Directory groups.
 
     .EXAMPLE
-        Add-Group -ComputerName "MyComputer" -GroupList "Group1,Group2,Group3"
-    
+        Add-Group -ComputerName "MyComputer" -GroupList "Group1,Group2,Group3"    
         This will add the computer "MyComputer" to the groups "Group1", "Group2", and "Group3".
 
     .NOTE
