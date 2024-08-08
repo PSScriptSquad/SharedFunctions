@@ -21,7 +21,7 @@ function Add-GroupMember {
         This will add the computer "MyComputer" to the groups "Group1", "Group2", and "Group3".
 
     .NOTE
-        Name: Add-Group
+        Name: Add-GroupMember
         Author: Ryan Whitlock
         Date: 08.07.2024
         Version: 1.0
