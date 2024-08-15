@@ -50,7 +50,7 @@ function Get-IPCalc {
         Changes: Initial release
     #>
     [CmdletBinding(DefaultParameterSetName='CIDR')]
-    [OutputType([pscustomobject])]
+    [OutputType([PSCustomObject])]
     param (
         # CIDR range parameter set.
         [Parameter(Mandatory, Position=1, ParameterSetName='CIDR')]
