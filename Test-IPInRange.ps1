@@ -39,13 +39,27 @@ function Test-IPInRange {
 
         # CIDR range parameter set.
         [parameter(Mandatory, Position=1, ParameterSetName='CIDR')]
-        [ValidateScript( {
-            if (-not ([System.Net.IPAddress]::TryParse($_, [ref]$null) -and 
-                      [System.Net.IPAddress]$_ -is [System.Net.IPAddress] -and 
-                      ([System.Net.IPAddress]$_).AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork)) {
-                Throw "$($_) does not appear to be a valid IPv4 address"
+        [ValidateScript({
+            # Split the input into IP address and prefix length
+            if ($_ -match '^(\d{1,3}(\.\d{1,3}){3})/(\d{1,2})$') {
+                $IPAddress = $matches[1]
+                $CIDRBits = [int]$matches[3]
+
+                # Validate that the IP address is a valid IPv4 address
+                if (-not [System.Net.IPAddress]::TryParse($IPAddress, [ref]$null)) {
+                    Throw "$IPAddress does not appear to be a valid IPv4 address"
+                }
+
+                # Validate that the prefix length is between 0 and 32
+                if ($CIDRBits -lt 0 -or $CIDRBits -gt 32) {
+                    Throw "$CIDRBits is not a valid CIDR prefix length. It should be between 0 and 32."
+                }
+
+                $true
             }
-            $true
+            else {
+                Throw "$($_) does not appear to be in valid CIDR notation (e.g., 192.168.1.0/24)"
+            }
         })]
         [string]
         $CIDR,
