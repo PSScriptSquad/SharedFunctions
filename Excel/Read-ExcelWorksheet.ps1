@@ -21,7 +21,7 @@ function Read-ExcelWorksheet {
             Author: Ryan Whitlock
             Date: 09.25.2022
             Version: 1.1
-            Changes: Fixed empty headers
+            Changes: Fixed empty headers 
     #>
     [CmdletBinding()]
     param (
