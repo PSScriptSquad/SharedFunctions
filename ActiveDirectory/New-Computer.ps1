@@ -38,19 +38,10 @@ function New-Computer {
         [ValidatePattern("^[a-zA-Z0-9\-]+$")]  
         [ValidateScript({
             try {
-                $Identity = Get-ADComputer -Identity $_ -ErrorAction Stop
-                if ($Identity) {
-                    throw "A computer with the name '$_' already exists in Active Directory."
-                } else {
-                    $true
-                }
-            } catch [Microsoft.ActiveDirectory.Management.ADServerDownException] {
-                throw "No domain connectivity. Please check your network and domain settings."
-            } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
-                $true # Computer does not exist, proceed
+                Test-ADComputerExistence -ComputerName $_ -ShouldNotExist
             } catch {
-                throw "An unexpected error occurred while checking for existing computer: $_"
-            }              
+                throw $_   
+            }           
         })]
         [ValidateNotNullOrEmpty()]
         [string]$ComputerName,
@@ -58,10 +49,9 @@ function New-Computer {
         [Parameter(Mandatory = $true)]
         [ValidateScript({
             try {
-                Get-ADOrganizationalUnit -Identity $_ -ErrorAction Stop
-                $true
+                Test-OUExistence -OUDistinguishedName $_
             } catch {
-                throw "The specified Organizational Unit '$_' does not exist or cannot be accessed."
+                throw "Error while processing computer '$ComputerName': $_"    
             }
         })]
         [ValidateNotNullOrEmpty()]
