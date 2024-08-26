@@ -28,17 +28,10 @@ function Remove-Computer {
         [Parameter(Mandatory = $true, Position = 0)]
         [ValidateScript({
             try {
-                $Identity = Get-ADComputer -Identity $_ -ErrorAction Stop
-                if ($Identity) {
-                    $true
-                } else {
-                    throw "A computer with the name '$_' does not exist in Active Directory."
-                }
-            } catch [Microsoft.ActiveDirectory.Management.ADServerDownException] {
-                throw "No domain connectivity. Please check your network and domain settings."
+                Test-ADComputerExistence -ComputerName $_ 
             } catch {
-                throw "A computer with the name '$_' does not exist in Active Directory."
-            }              
+                throw $_  
+            }           
         })]
         [ValidateNotNullOrEmpty()]
         [string]$ComputerName
@@ -50,7 +43,7 @@ function Remove-Computer {
             try {
                 # Remove the computer from Active Directory
                 Remove-ADComputer -Identity $ComputerName -Confirm:$false -ErrorAction Stop
-                Write-Output "Computer '$ComputerName' has been successfully removed from Active Directory." -ForegroundColor Green
+                Write-Host "Computer $ComputerName has been successfully removed from Active Directory." -ForegroundColor Green
             }
             catch {
                 throw "Failed to remove computer '$ComputerName' from Active Directory."
@@ -62,14 +55,14 @@ function Remove-Computer {
                 if ($null -ne $computer) {
                     throw "Computer '$ComputerName' still exists in Active Directory. Removal might have failed."
                 } else {
-                    Write-Output "Verified that computer '$ComputerName' has been removed from Active Directory." -ForegroundColor Green
+                    Write-Host "Verified that computer '$ComputerName' has been removed from Active Directory." -ForegroundColor Green
                 }
             }
             catch {
                 throw "Error occurred while verifying the removal of computer '$ComputerName'."
             }
         } else {
-            Write-Output "Operation for removing computer '$ComputerName' was skipped due to WhatIf or Confirm preference." -ForegroundColor Yellow
+            Write-Host "Operation for removing computer '$ComputerName' was skipped due to WhatIf or Confirm preference." -ForegroundColor Yellow
         }
     }
 }
