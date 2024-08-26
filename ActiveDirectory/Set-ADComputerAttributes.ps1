@@ -42,17 +42,10 @@ function Set-ADComputerAttributes {
         [Parameter(Mandatory = $true)]
         [ValidateScript({
             try {
-                $Identity = Get-ADComputer -Identity $_ -ErrorAction Stop
-                if ($Identity) {
-                    $true
-                } else {
-                    throw "A computer with the name '$_' does not exist in Active Directory."
-                }
-            } catch [Microsoft.ActiveDirectory.Management.ADServerDownException] {
-                throw "No domain connectivity. Please check your network and domain settings."
+                Test-ADComputerExistence -ComputerName $_ 
             } catch {
-                throw "A computer with the name '$_' does not exist in Active Directory."
-            }              
+                throw $_    
+            }           
         })]
         [ValidateNotNullOrEmpty()]
         [string]$ComputerName,
@@ -73,9 +66,9 @@ function Set-ADComputerAttributes {
                         # Validate the attribute was set
                         $updatedComputer = Get-ADComputer -Identity $ComputerName -Properties $ADAttribute.Name -ErrorAction Stop
                         if ($updatedComputer.$($ADAttribute.Name) -eq $ADAttribute.Value) {
-                            Write-Output "Successfully set '$($ADAttribute.Name)' to '$($ADAttribute.Value)' on '$ComputerName'." -ForegroundColor Green
+                            Write-Host "Successfully set $($ADAttribute.Name) to $($ADAttribute.Value) on $ComputerName." -ForegroundColor Green
                         } else {
-                            Write-Error "Failed to set '$($ADAttribute.Name)' to '$($ADAttribute.Value)' on '$ComputerName'."
+                            Write-Error "Failed to set $($ADAttribute.Name) to $($ADAttribute.Value) on $ComputerName."
                         }
                     }
                 } catch {
