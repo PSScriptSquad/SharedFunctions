@@ -20,8 +20,8 @@ function Read-ExcelWorksheet {
             Name: Read-ExcelWorksheet
             Author: Ryan Whitlock
             Date: 09.25.2022
-            Version: 1.7
-            Changes: Added additional validations for worksheet existence, empty worksheet, and cell content length.
+            Version: 1.8
+            Changes: Use [string]::IsNullOrEmpty() to check for null or empty headers. Improved ValidateScript handling.
     #>
     [CmdletBinding()]
     param (
@@ -29,20 +29,21 @@ function Read-ExcelWorksheet {
         [Parameter(Mandatory=$true)]
         [ValidateNotNullOrEmpty()]
         [ValidateScript({
-            if (-not (Test-Path $_)) {
-                throw "File does not exist: $_"
+            $Path = $_
+
+            if (-not (Test-Path $Path)) {
+                throw "File does not exist: $Path"
             }
 
             # Check if the file is locked by another process
-            $Path = $_
             try {
                 $fileStream = [System.IO.File]::Open($Path.FullName, 'Open', 'Read', 'Read')
                 $fileStream.Close()
             } catch {
-                throw "The file: '$($Path.FullName)' is locked and cannot be accessed."
+                throw "The file '$($Path.FullName)' is locked and cannot be accessed."
             }
 
-            $extension = [System.IO.Path]::GetExtension($_)
+            $extension = [System.IO.Path]::GetExtension($Path.FullName)
             if ($extension -notin ".xlsx", ".xlsm", ".xlsb", ".xls") {
                 throw "Invalid file extension: $extension. Only .xlsx, .xlsm, .xlsb, and .xls are allowed."
             }
@@ -65,12 +66,12 @@ function Read-ExcelWorksheet {
 
     process {
         # Open the workbook
-        $Workbook = $excel.Workbooks.Open($FilePath)
+        $Workbook = $Excel.Workbooks.Open($FilePath)
 
         try {
             # Get the specified worksheet
             $Worksheet = $Workbook.Sheets.Item($WorksheetName)
-            if (-not $worksheet) {
+            if (-not $Worksheet) {
                 throw "The worksheet '$WorksheetName' does not exist in the file '$FilePath'."
             }
 
@@ -96,7 +97,7 @@ function Read-ExcelWorksheet {
 
             for ($col = 1; $col -le $LastColumn; $col++) {
                 $HeaderText = $Worksheet.Cells.Item(1, $col).Text.Trim()
-                if ($HeaderText -eq "") {
+                if ([string]::IsNullOrEmpty($HeaderText)) {
                     # Skip this column if the header is empty
                     continue
                 }
@@ -117,7 +118,7 @@ function Read-ExcelWorksheet {
                     if ($CellValue.Length -gt 255) {
                         throw "Cell in row $row, column $col exceeds the maximum allowed length of 255 characters."
                     }
-                    if ($CellValue -ne "") {
+                    if (-not [string]::IsNullOrEmpty($CellValue)) {
                         $IsRowEmpty = $false
                     }
                     $RowObject | Add-Member -MemberType NoteProperty -Name $Headers[$ValidColumns.IndexOf($col)] -Value $CellValue
