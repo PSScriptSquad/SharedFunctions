@@ -34,10 +34,12 @@ function Read-ExcelWorksheet {
             }
 
             # Check if the file is locked by another process
+            $Path = $_
             try {
-                [void] [System.IO.File]::Open($_.FullName, 'Open', 'Read', 'Read')
+                $fileStream = [System.IO.File]::Open($Path.FullName, 'Open', 'Read', 'Read')
+                $fileStream.Close()
             } catch {
-                throw "The file '$($_.FullName)' is locked and cannot be accessed."
+                throw "The file: '$($Path.FullName)' is locked and cannot be accessed."
             }
 
             $extension = [System.IO.Path]::GetExtension($_)
