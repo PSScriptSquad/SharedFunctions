@@ -36,7 +36,6 @@ function Get-LastLogon {
     .NOTES
         Name: Get-LastLogon
         Author: Ryan Whitlock
-        Inspired by: krzydoug - https://www.reddit.com/r/PowerShell/comments/mfvgwn/getlastlogon_get_accurate_last_logon_time_for_user/
         Date: 09.10.2024
         Version: 1.0
         Changes: Initial release    
@@ -123,18 +122,18 @@ function Get-LastLogon {
             }
 
             # Process the logon times from all domain controllers
-            $LogonTimes = $Results | Where-Object { $_.LastLogon -ne $null } | ForEach-Object {
+            $LogonTimes = @($Results | Where-Object { $_.LastLogon -ne $null } | ForEach-Object {
                 [datetime]::FromFileTime($_.LastLogon)
-            }
-            $LogonTimestamps = $Results | Where-Object { $_.LastLogonTimestamp -ne $null } | ForEach-Object {
+            })
+            $LogonTimestamps = @($Results | Where-Object { $_.LastLogonTimestamp -ne $null } | ForEach-Object {
                 [datetime]::FromFileTime($_.LastLogonTimestamp)
-            }
+            })
 
-            # Combine logon times and timestamps, sort them, and find the most recent one
-            $AllLogonTimes = $LogonTimes + $LogonTimestamps | Sort-Object -Descending | Select-Object -First 1
+            # Combine logon times and timestamps, ignoring null values
+            $AllLogonTimes = $LogonTimes + $LogonTimestamps | Where-Object { $_ -ne $null } | Sort-Object -Descending | Select-Object -First 1
 
             if ($AllLogonTimes) {
-                if ($allLogonTimes.Year -eq 1601) {
+                if ($AllLogonTimes.Year -le 1900) {
                     [PSCustomObject]@{
                         User      = $CurrentUser
                         LastLogon = "Never logged on"
