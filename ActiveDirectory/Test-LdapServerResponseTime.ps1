@@ -94,9 +94,14 @@ function Test-LdapServerResponseTime {
                     $elapsedTime = $stopwatch.ElapsedMilliseconds
                     $responseTimes += $elapsedTime
 
+                    # Calculate running statistics
+                    $avgTime = [Math]::Round(($responseTimes | Measure-Object -Average).Average, 2)
+                    $minTime = ($responseTimes | Measure-Object -Minimum).Minimum
+                    $maxTime = ($responseTimes | Measure-Object -Maximum).Maximum
+
                     # Record the timestamp and response time in the queue
                     $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
-                    $Queue.Enqueue("$Server`:$Port | $currentTime - Response time: $elapsedTime ms")
+                    $Queue.Enqueue("$Server`:$Port | $currentTime - Response time: $elapsedTime ms | Avg: $avgTime ms | Min: $minTime ms | Max: $maxTime ms")
 
                 } catch [System.DirectoryServices.Protocols.LdapException] {
                     $Queue.Enqueue("$Server`:$Port | LDAP Error: $($_.Message)")
@@ -172,7 +177,7 @@ function Test-LdapServerResponseTime {
             }
             Start-Sleep -Milliseconds 100
         }
-        
+
         # Output the summary results of all tests
         Write-Output $resultBag
     }
