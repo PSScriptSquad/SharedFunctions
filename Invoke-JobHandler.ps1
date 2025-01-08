@@ -1,79 +1,121 @@
 function Invoke-JobHandler {
     <#
     .SYNOPSIS
-        Waits for PowerShell jobs to reach a terminating state, while tracking progress.
+        Waits for PowerShell jobs to reach a terminating state, while tracking progress, with optional handling of Suspended and Disconnected states.
 
     .DESCRIPTION
-        The Invoke-JobHandler cmdlet waits for a job to be in a terminating state before continuing execution. The terminating states are:
-        Completed, Failed, Stopped, Suspended, and Disconnected. 
+        The Invoke-JobHandler cmdlet waits for one or more PowerShell jobs to reach a terminating state before continuing execution. 
+        The cmdlet provides the ability to track job progress and handle custom timeout conditions. It also supports waiting for specific jobs
+        by ID, Name, or InstanceId, and can filter jobs by their state or other properties using a filter hashtable.
 
-        You can wait until a specified job, or all jobs, are in a terminating state. You can also set a maximum wait time for the job using 
-        the Timeout parameter, or use the Force parameter to wait for a job in the Suspended or Disconnected states.
+        By default, the cmdlet will stop waiting when all specified jobs are in one of the following terminating states:
+        Completed, Failed, Stopped, Suspended, or Disconnected.
 
-        This cmdlet supports local jobs started using Start-Job, and remote jobs created using Invoke-Command with the -AsJob parameter. 
-        Custom job types, such as workflow jobs or scheduled jobs, are also supported if the module defining them is imported into the session.
+        If the -Force parameter is used, the cmdlet will continue waiting for jobs that are in Suspended or Disconnected states 
+        until they move to a final state such as Completed, Failed, or Stopped.
+
+        The cmdlet supports both local jobs started using Start-Job and remote jobs created using Invoke-Command with the -AsJob parameter. 
+        Custom job types, such as workflow jobs or scheduled jobs, are also supported if the appropriate module defining them is imported 
+        into the session.
 
     .PARAMETER Job
-        Specifies the jobs for which this cmdlet waits. Enter a variable that contains the job objects or a command 
-        that gets the job objects. You can also use a pipeline operator to send job objects to the Invoke-JobHandler cmdlet. 
-        By default, Invoke-JobHandler waits for all jobs created in the current session.
+        Specifies the job objects to wait for. This can be provided as a variable that contains job objects or via pipeline input. 
+        You can also retrieve job objects by using Get-Job and passing them to Invoke-JobHandler.
 
     .PARAMETER Id
-        Specifies an array of IDs of jobs for which this cmdlet waits.
-
-        The ID is an integer that uniquely identifies the job in the current session. It is easier to remember and type than the instance ID, 
-        but it is unique only in the current session. You can type one or more IDs, separated by commas. To find the ID of a job, type Get-Job.
+        Specifies the IDs of jobs to wait for. You can provide one or more job IDs as an array. To get the job IDs, use Get-Job.
 
     .PARAMETER Name
-        Specifies friendly names of jobs for which this cmdlet waits.
+        Specifies the friendly names of jobs to wait for. You can provide one or more job names. To get the names, use Get-Job.
 
     .PARAMETER InstanceId
-        Specifies an array of instance IDs of jobs for which this cmdlet waits. The default is all jobs.
-
-        An instance ID is a GUID that uniquely identifies the job on the computer. To find the instance ID of a job, use Get-Job.
+        Specifies the instance IDs (GUIDs) of jobs to wait for. Each instance ID uniquely identifies a job. 
+        To get the instance ID of a job, use Get-Job.
 
     .PARAMETER State
-        Specifies a job state. This cmdlet waits only for jobs in the specified state (e.g., Completed, Running, Failed).
+        Specifies a job state to wait for. The cmdlet will wait only for jobs in the specified state (e.g., Running, Completed, Failed, Stopped).
 
     .PARAMETER Filter
-        Specifies a hash table of conditions. This cmdlet waits for jobs that satisfy all of the conditions in the hash table. 
-        Enter a hash table where the keys are job properties and the values are job property values.
-
-        This parameter works only on custom job types, such as workflow jobs and scheduled jobs. It does not work on standard jobs, 
-        such as those created by using the Start-Job cmdlet. For information about support for this parameter, see the help topic for the job type.
+        Specifies a hash table to filter jobs based on their properties. The key is the property name, and the value is the property value. 
+        Only jobs that match all conditions in the hash table will be waited for. This parameter is useful for filtering custom job types.
 
     .PARAMETER Any
-        Indicates that this cmdlet returns the job object and continues execution when any job finishes. By default, 
-        Invoke-JobHandler waits until all of the specified jobs are complete before it displays the prompt.
+        Returns and continues execution as soon as any of the specified jobs reach a terminating state, instead of waiting for all jobs to complete.
 
     .PARAMETER Timeout
-        Specifies the maximum wait time for each job, in seconds. The default value, -1, indicates that the cmdlet waits 
-        until the job finishes. The timing starts when the job starts.
-
-        If this time is exceeded, the wait ends and execution continues, even if the job is still running. The command does 
-        not display any error message.
+        Specifies the maximum wait time for each job, in seconds. By default, there is no timeout (-1). If a job exceeds the specified timeout, 
+        it will be stopped, and execution will continue.
 
     .PARAMETER Force
-        Indicates that this cmdlet continues to wait for jobs in the Suspended or Disconnected state. By default, Invoke-JobHandler returns, 
-        or ends the wait, when jobs are in one of the following states:
-            Completed
-            Failed
-            Stopped
-            Suspended
-            Disconnected
-        
+        Continues waiting for jobs in the Suspended or Disconnected states. Without the -Force parameter, the cmdlet considers 
+        these states as terminating, and the wait ends. With -Force, the cmdlet will continue waiting until the jobs move to a final state 
+        (Completed, Failed, or Stopped).
+
     .PARAMETER ShowProgress
-        Indicates that this cmdlet should show progress of the Job(s) it is waiting for. 
+        Displays the progress of the jobs being tracked. The progress bar updates as jobs complete.
 
     .EXAMPLE
+        # Example 1: Wait for all jobs to complete
         Get-Job | Invoke-JobHandler
 
-        This command waits for all of the jobs running in the current session to finish.
+        This example waits for all jobs running in the current session to complete. It uses pipeline input from Get-Job.
 
     .EXAMPLE
-        Invoke-JobHandler -Id 5 -Force
+        # Example 2: Wait for a specific job by ID with a timeout
+        Invoke-JobHandler -Id 5 -Timeout 60
 
-        Waits for the job with ID 5 to complete, waiting even if it is in a Suspended or Disconnected state.
+        Waits for the job with ID 5 to complete, with a maximum wait time of 60 seconds. If the job is still running after 60 seconds, 
+        it will be stopped.
+
+    .EXAMPLE
+        # Example 3: Continue waiting even if the job is Suspended or Disconnected
+        Invoke-JobHandler -Id 10 -Force
+
+        Waits for the job with ID 10 to complete, even if it enters a Suspended or Disconnected state. Without the -Force parameter, 
+        the cmdlet would stop waiting when the job enters either of those states.
+
+    .EXAMPLE
+        # Example 4: Wait for jobs in a specific state (e.g., only jobs that are currently running)
+        Invoke-JobHandler -State Running
+
+        This waits for all jobs that are currently running in the session. The cmdlet will exit once all running jobs are in a terminating state.
+
+    .EXAMPLE
+        # Example 5: Use a filter to wait for jobs with specific properties
+        $filter = @{
+            Name = "BackupJob"
+            State = "Running"
+        }
+        Invoke-JobHandler -Filter $filter
+
+        This example waits for jobs that have the name "BackupJob" and are currently in the "Running" state. Only jobs that meet both 
+        criteria will be waited for.
+
+    .EXAMPLE
+        # Example 6: Show progress while waiting for jobs
+        Invoke-JobHandler -Name "MyJob" -ShowProgress
+
+        This waits for the job named "MyJob" to complete and shows a progress bar that updates as the job runs.
+
+    .EXAMPLE
+        # Example 7: Return as soon as any job completes
+        $jobs = Get-Job -Name "Job1", "Job2", "Job3"
+        Invoke-JobHandler -Job $jobs -Any
+
+        This example waits for the first job (Job1, Job2, or Job3) to complete and returns immediately, without waiting for all jobs to finish.
+
+    .EXAMPLE
+        # Example 8: Wait for remote jobs and handle child jobs
+        $remoteJob = Invoke-Command -ComputerName "Server01" -ScriptBlock { Start-Sleep 10 } -AsJob
+        Invoke-JobHandler -Job $remoteJob
+
+        This waits for the remote job on Server01 to complete. If the remote job has child jobs, they will be handled and waited for as well.
+
+    .NOTES
+        Author: Ryan Whitlock
+        Date: 09.16.2024
+        Version: 1.0
+        Changes: Initial release
     #>
 
     [CmdletBinding(DefaultParameterSetName = 'IdParameterSet')]
@@ -176,7 +218,7 @@ function Invoke-JobHandler {
         # function to handle job timeouts
         function Invoke-JobTimeoutHandler {
             param (
-                [System.Management.Automation.Job]$Job,
+                [System.Management.Automation.Job[]]$Job,
                 [int]$Timeout
             )
 
@@ -193,7 +235,7 @@ function Invoke-JobHandler {
             }
 
             # Convert the timeout to a timespan for easy comparison
-            $TimeoutDuration = [TimeSpan]::FromMinutes($Timeout)
+            $TimeoutDuration = [TimeSpan]::FromSeconds($Timeout)
 
             # Calculate elapsed time
             $ElapsedTime = $(Get-Date) - $Job.PSBeginTime
@@ -205,7 +247,7 @@ function Invoke-JobHandler {
 
                 # Try to stop the job safely
                 try {
-                    Stop-Job -Job $Job -Force
+                    Stop-Job -Job $Job
                     Write-Verbose "Job $($Job.Id) has been stopped."
                 }
                 catch {
@@ -224,37 +266,41 @@ function Invoke-JobHandler {
             # Collect results and errors
             $Results = foreach ($Job in $AllJobs) {
                 if ($Job.State -eq 'Failed') {
+                    # Job failed before execution, likely connection or setup failure
                     [PSCustomObject]@{
                         'ComputerName' = $Job.Location
+                        'Output'       = $null  # No output since the job failed
                         'Error'        = $Job.JobStateInfo.Reason.Message
+                        'ErrorType'    = 'JobFailed'
                     }
                 } else {
                     try {
                         $Output = Receive-Job -Job $Job -ErrorAction Stop
+                        # Return the result without duplicating ComputerName if it's in the output
                         [PSCustomObject]@{
                             'ComputerName' = $Job.Location
                             'Output'       = $Output
+                            'Error'        = $null  # No error if execution succeeded
+                            'ErrorType'    = $null  # No error type if execution succeeded
                         }
                     } catch {
+                        # Execution error on the remote system
                         [PSCustomObject]@{
                             'ComputerName' = $Job.Location
-                            'Error'        = $_.Exception.Message
+                            'Output'       = $null  # No valid output due to execution failure
+                            'Error'        = 'ExecutionError: ' + $_.Exception.Message
+                            'ErrorType'    = 'ExecutionError'
                         }
                     }
                 }
             }
 
-            # Remove all parent jobs (removing parent jobs also removes child jobs)
-            $ParentJobs = Get-Job | Where-Object { $_.ChildJobs.Count -eq 0 }
-            $ParentJobs | ForEach-Object { Remove-Job -Job $_ }
-
-            # Return responding and non-responding systems
-            return [PSCustomObject]@{
-                RespondingSystems    = $Results | Where-Object { -not $_.Error }
-                NotRespondingSystems = $Results | Where-Object { $_.Error }
-            }
-        }   
-      
+            # Remove all parent jobs (removing parent jobs also removes child jobs)           
+            Get-Job | Where { ($_.Id -in $AllJobs.ParentJobId) -or ($AllJobs.ParentJobId -eq $null) } | Remove-Job
+                        
+            # Return all results
+            return $Results
+        }      
 
         # End helper functions
         
@@ -299,7 +345,12 @@ function Invoke-JobHandler {
         # Handle remote jobs and ensure that child jobs are included for tracking
         $AllJobs = foreach ($Job in $jobsToWaitFor) {
             if ($Job.PSJobTypeName -eq "RemoteJob"){
-                $Job.ChildJobs
+                foreach ($ChildJob in $Job.ChildJobs) {
+                    # Add the parent job reference to the child job
+                    $ChildJob | Add-Member -MemberType NoteProperty -Name ParentJobId -Value $Job.Id -Force
+                    $ChildJob | Add-Member -MemberType NoteProperty -Name ParentJobName -Value $Job.Name -Force
+                    $ChildJob
+                }
             } else {
                 $Job
             }
@@ -309,26 +360,38 @@ function Invoke-JobHandler {
         $CompletedJobsCount = 0
     }
 
-    process {        
-        while ($true){
-            # Refresh job states by getting updated job objects (so we reflect their latest states)
-            $AllJobs = $AllJobs | ForEach-Object { Get-Job -Id $_.Id }
+    process {
+        $GetJobFrequency = 5  # Time in seconds to refresh job states with Get-Job
+        $ElapsedTimeSinceGetJob = 0  # Track time since last Get-Job
+        $JobStateCache = $AllJobs.Clone()  # Clone to maintain current state without frequent Get-Job
+           
+        while ($true){            
+            if ($ElapsedTimeSinceGetJob -ge $GetJobFrequency) {
+                # Refresh job states by getting updated job objects (so we reflect their latest states)
+                $JobStateCache = $AllJobs | ForEach-Object {
+                    if (Get-Job -Id $_.Id -ErrorAction SilentlyContinue) {
+                        Get-Job -Id $_.Id
+                    } else {
+                        Write-Warning "Job with ID $_.Id does not exist."
+                    }
+                }
+                $ElapsedTimeSinceGetJob = 0  # Reset the timer
+            }
 
-            # Count jobs that have reached a "final" state (Completed, Failed, Stopped) or are in states we care about
-            $CompletedJobsCount = ($AllJobs | Where-Object { $_.State -in 'Completed', 'Failed', 'Stopped' }).Count
+            # Count jobs that have reached a "final" state (Completed, Failed, Stopped)
+            $CompletedJobsCount = ($JobStateCache | Where-Object { $_.State -in 'Completed', 'Failed', 'Stopped' }).Count
 
             # If Force is NOT used, include Suspended and Disconnected as "completed" states
             if (-not $Force) {
-                $CompletedJobsCount += ($AllJobs | Where-Object { $_.State -in 'Suspended', 'Disconnected' }).Count
+                $CompletedJobsCount += ($JobStateCache | Where-Object { $_.State -in 'Suspended', 'Disconnected' }).Count
             }
 
-            # If all jobs are completed (depending on the Force parameter), break the loop
             if ($CompletedJobsCount -eq $TotalJobsCount) {
                 break
             }
             
             if ($ShowProgress) {
-                foreach ($AllJob in $AllJobs) {
+                foreach ($AllJob in $JobStateCache) {
                     $ProgressHelperArg = @{
                         Activity         = "Waiting for jobs to complete"
                         i                = $CompletedJobsCount
@@ -338,20 +401,22 @@ function Invoke-JobHandler {
                     Write-ProgressHelper @ProgressHelperArg                    
                 
                     Start-Sleep -Seconds 1
+                    $ElapsedTimeSinceGetJob++
                 }        
             } else {
                 Start-Sleep -Seconds 1
+                $ElapsedTimeSinceGetJob++
             }
 
             # Invoke timeout handling if applicable
             if ($Timeout -ne -1) {
-                foreach ($Job in $AllJobs) {
+                foreach ($Job in $JobStateCache) {
                     Invoke-JobTimeoutHandler -Job $Job -Timeout $Timeout
                 }
             }
 
             # If Any is specified, break out if any job completes
-            if ($Any -and ($AllJobs.State -contains "Completed")) {
+            if ($Any -and ($JobStateCache.State -contains "Completed")) {
                 break
             }
         }
@@ -359,11 +424,22 @@ function Invoke-JobHandler {
         if ($ShowProgress) {
             Write-Progress -Activity "Waiting for jobs to complete" -Status "Completed." -Completed
         }
+        
+        # Stop and remove any orphaned jobs if -Any is used
+        if ($Any) {
+            # Stop any jobs that are still running to prevent them from being orphaned
+            $RunningJobs = $JobStateCache | Where-Object { $_.State -eq 'Running' }
+            if ($RunningJobs.Count -gt 0) {
+                Write-Verbose "Stopping any remaining running jobs since -Any was used."
+                $RunningJobs | ForEach-Object { Stop-Job -Job $_ | Remove-Job -Force}
+            }
+        }        
 
-        return Get-JobResults -AllJobs $AllJobs
+        return Get-JobResults -AllJobs $JobStateCache
     }
 
     end {
 
     }
 }
+
