@@ -1,37 +1,44 @@
 function Test-LdapServerResponseTime {
     <#
     .SYNOPSIS
-        This function tests the response time of LDAP servers for different protocols (LDAP, LDAPS, GC, GCSSL) over a specified duration.
+        Tests the response time of LDAP servers for different protocols (LDAP, LDAPS, GC, GCSSL) over a specified duration.
 
     .DESCRIPTION
-        The `Test-LdapServerResponseTime` function performs repeated LDAP searches against a list of servers to measure response times. 
+        This function performs repeated LDAP searches against a list of servers to measure response times. 
         The results are displayed and include average, minimum, and maximum response times for each server. 
         The function supports multiple protocols: LDAP, LDAPS, GC, and GCSSL, and can be configured for a custom test duration.
+        Additionally, the frequency at which queries are sent can be adjusted from 0.5 seconds to 60 seconds.
 
     .PARAMETER Servers
-        A list of LDAP servers to test. This parameter is mandatory and can accept an array of server names or IP addresses.
+        A list of LDAP servers to test. Accepts an array of server names or IP addresses.
 
     .PARAMETER TestDuration
-        The duration (in seconds) for which the test will run on each server. The default is 30 seconds. This parameter is optional.
+        The duration (in seconds) for which the test will run on each server. The default is 30 seconds.
 
     .PARAMETER Protocol
-        The LDAP protocol to use for the connection. It can be one of the following: "LDAP", "LDAPS", "GC", or "GCSSL". The default is "LDAP". 
-        This parameter is optional.
+        The LDAP protocol to use for the connection. Valid values: "LDAP", "LDAPS", "GC", "GCSSL". Default: "LDAP".
+
+    .PARAMETER RequestFrequency
+        How often (in seconds) to send each LDAP query to the server. 
+        Accepts a decimal value between 0.5 (half a second) and 60 (one minute). 
+        Default is 1 (one second).
 
     .EXAMPLE
         Test-LdapServerResponseTime -Servers "ldap.example.com" -TestDuration 60 -Protocol "LDAPS"
-        This command tests the response time of the server "ldap.example.com" using the "LDAPS" protocol for a duration of 60 seconds.
+        Tests the response time of "ldap.example.com" over LDAPS for 60 seconds, sending a query every second.
 
     .EXAMPLE
-        Test-LdapServerResponseTime -Servers @("ldap1.example.com", "ldap2.example.com") -TestDuration 30 -Protocol "GC"
-        This command tests the response time of two servers, "ldap1.example.com" and "ldap2.example.com", using the "GC" protocol for 30 seconds.
+        Test-LdapServerResponseTime -Servers @("ldap1.example.com","ldap2.example.com") -TestDuration 30 -Protocol "GC" -RequestFrequency 0.5
+        Tests the response time of two servers using the GC protocol for 30 seconds, sending queries every half second.
 
     .NOTES
         Name: Test-LdapServerResponseTime
         Author: Ryan Whitlock
         Date: 11.25.2024
-        Version: 1.0
-        Changes: Initial Release
+        Version: 1.1
+        Changes:
+            - Switched to named capturing groups in regex.
+            - Parameterized the sleep interval for the LDAP requests (RequestFrequency).
     #>
     [CmdletBinding()]
     param (
@@ -43,10 +50,45 @@ function Test-LdapServerResponseTime {
 
         [Parameter(Mandatory = $false)]
         [ValidateSet("LDAP", "LDAPS", "GC", "GCSSL")]
-        [string]$Protocol = "LDAP"
+        [string]$Protocol = "LDAP",
+
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(0.25, 60)]
+        [double]$RequestFrequency = 1
     )
 
     Begin {
+        # Hashtable for server-specific colors
+        $global:serverColors = @{}
+        # Define a list of available foreground colors (can be adjusted as needed)
+        $global:availableColors = @(
+            "Yellow", "Cyan", "Magenta", "Gray", 
+            "DarkYellow", "DarkCyan", "DarkMagenta", "White"
+        )
+
+        # Helper function to get a (mostly) unique color for each server
+        function Get-ServerColor {
+            param ([string]$ServerName)
+
+            if (-not $global:serverColors.ContainsKey($ServerName)) {
+                # Find which colors are already in use
+                $usedColors = $global:serverColors.Values
+                # Filter out used colors to find what's unassigned
+                $unassigned = $global:availableColors | Where-Object { $usedColors -notcontains $_ }
+
+                if ($unassigned.Count -gt 0) {
+                    # If there is at least one unassigned color, pick from that subset
+                    $randIndex = Get-Random -Minimum 0 -Maximum $unassigned.Count
+                    $global:serverColors[$ServerName] = $unassigned[$randIndex]
+                }
+                else {
+                    # All colors used, pick from the full list again
+                    $randIndex = Get-Random -Minimum 0 -Maximum $global:availableColors.Count
+                    $global:serverColors[$ServerName] = $global:availableColors[$randIndex]
+                }
+            }
+            return $global:serverColors[$ServerName]
+        }
 
         # Store detailed results for summary
         $serverResults = @()
@@ -56,6 +98,7 @@ function Test-LdapServerResponseTime {
                 [string]$Server,
                 [string]$Protocol,
                 [int]$TestDuration,
+                [double]$Frequency,
                 [System.Collections.Concurrent.ConcurrentQueue[string]]$Queue,
                 [System.Collections.Concurrent.ConcurrentBag[PSCustomObject]]$ResultBag
             )
@@ -69,37 +112,36 @@ function Test-LdapServerResponseTime {
             }
             $Port = $LDAPPorts[$Protocol]
 
-            # Load the required .NET assembly for Directory Services
+            # Load .NET assembly for Directory Services
             Add-Type -AssemblyName System.DirectoryServices.Protocols
 
-            # Set the end time based on the test duration
+            # End time
             $endTime = (Get-Date).AddSeconds($TestDuration)
             $responseTimes = @()
 
-            # Run the test until the duration is complete
             while ((Get-Date) -lt $endTime) {
                 try {
-                    # Start measuring the response time
+                    # Start measuring
                     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                     
-                    # Create an LDAP connection and searcher
+                    # Create an LDAP connection/search
                     $ldapConnection = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$Server`:$Port")
                     $searcher = New-Object System.DirectoryServices.DirectorySearcher($ldapConnection)
                     $searcher.Filter = "(objectClass=*)"
                     $searcher.PageSize = 1
                     $null = $searcher.FindOne()
                     
-                    # Stop measuring and record the response time
+                    # Stop measuring
                     $stopwatch.Stop()
                     $elapsedTime = $stopwatch.ElapsedMilliseconds
                     $responseTimes += $elapsedTime
 
-                    # Calculate running statistics
+                    # Stats
                     $avgTime = [Math]::Round(($responseTimes | Measure-Object -Average).Average, 2)
                     $minTime = ($responseTimes | Measure-Object -Minimum).Minimum
                     $maxTime = ($responseTimes | Measure-Object -Maximum).Maximum
 
-                    # Record the timestamp and response time in the queue
+                    # Enqueue results
                     $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
                     $Queue.Enqueue("$Server`:$Port | $currentTime - Response time: $elapsedTime ms | Avg: $avgTime ms | Min: $minTime ms | Max: $maxTime ms")
 
@@ -112,16 +154,17 @@ function Test-LdapServerResponseTime {
                 } catch {
                     $Queue.Enqueue("$Server`:$Port | Unexpected Error: $($_.Exception.Message)")
                 }
-                Start-Sleep -Seconds 1
+
+                # Sleep for the user-defined interval (0.25 to 60 seconds)
+                Start-Sleep -Seconds $Frequency
             }
 
-            # Collect statistics if there are response times
+            # Summary
             if ($responseTimes.Count -gt 0) {
                 $avgTime = [Math]::Round(($responseTimes | Measure-Object -Average).Average, 2)
                 $minTime = ($responseTimes | Measure-Object -Minimum).Minimum
                 $maxTime = ($responseTimes | Measure-Object -Maximum).Maximum
 
-                # Add summary object to the ResultBag
                 $result = [PSCustomObject]@{
                     Server    = $Server
                     Protocol  = $Protocol
@@ -130,36 +173,34 @@ function Test-LdapServerResponseTime {
                     Maximum   = $maxTime
                 }
                 $null = $ResultBag.Add($result)
-            } else {
+            }
+            else {
                 $Queue.Enqueue("No successful responses recorded for server: $Server")
             }
         }
 
-        # Setup runspace pool for parallel processing
+        # Runspace pool
         $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
         $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList "Test-LDAP", ${function:Test-LDAP}))
-
-        # Create the runspace pool for concurrent execution
         $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool($iss)
         $runspacePool.SetMinRunspaces(1) | Out-Null
         $runspacePool.SetMaxRunspaces([Environment]::ProcessorCount) | Out-Null
         $runspacePool.Open()
 
-        # Initialize concurrent collections for storing results
+        # Shared data structures
         $queue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
         $resultBag = [System.Collections.Concurrent.ConcurrentBag[PSCustomObject]]::new()
         $runspaces = @()
     }
 
     Process {
-        # Start a new runspace for each server to test in parallel
+        # Launch a runspace for each server
         $runspaces = foreach ($Server in $Servers) {
             $runspace = [powershell]::Create().AddScript({
-                param($Server, $Protocol, $TestDuration, $Queue, $ResultBag)
-                Test-LDAP -Server $Server -Protocol $Protocol -TestDuration $TestDuration -Queue $Queue -ResultBag $ResultBag
-            }).AddArgument($Server).AddArgument($Protocol).AddArgument($TestDuration).AddArgument($queue).AddArgument($resultBag)
+                param($Server, $Protocol, $TestDuration, $Frequency, $Queue, $ResultBag)
+                Test-LDAP -Server $Server -Protocol $Protocol -TestDuration $TestDuration -Frequency $Frequency -Queue $Queue -ResultBag $ResultBag
+            }).AddArgument($Server).AddArgument($Protocol).AddArgument($TestDuration).AddArgument($RequestFrequency).AddArgument($queue).AddArgument($resultBag)
 
-            # Assign the runspace to the pool
             $runspace.RunspacePool = $runspacePool
             [PSCustomObject]@{
                 Pipe   = $runspace
@@ -167,28 +208,73 @@ function Test-LdapServerResponseTime {
             }
         }
 
-        # Monitor and output progress while the runspaces are running
+        # Collect output
         while ($runspaces.Handle.IsCompleted -contains $false -or !$queue.IsEmpty) {
             while (!$queue.IsEmpty) {
                 $item = $null
                 if ($queue.TryDequeue([ref]$item)) {
-                    Write-Host $item -ForegroundColor Green
+                    # Typical format: "servername:port | yyyy-MM-dd HH:mm:ss.fff - Response time: XXX ms | Avg: X ms | Min: X ms | Max: X ms"
+                    $serverPort = $item.Split(" |")[0]
+                    $serverName = $serverPort.Split(":")[0]
+
+                    # Retrieve or assign a color for this server
+                    $serverColor = Get-ServerColor -ServerName $serverName
+
+                    # For errors or "No successful responses", just print everything in the server color
+                    if ($item -match "Error|No successful responses|Access Denied|Network Error|Unexpected Error") {
+                        Write-Host "[$serverName] $item" -ForegroundColor $serverColor
+                        continue
+                    }
+
+                    # Remove "servername:port | " to avoid double printing
+                    $parsedMessage = $item.Substring($serverPort.Length + 3) 
+
+                    # Use named capturing groups to parse date/time, response time, and the remainder
+                    $regex = '^(?<prefix>.*?) - Response time: (?<time>\d+) ms(?<rest>.*)$'
+                    if ($parsedMessage -match $regex) {
+                        $dateAndPrefix = $Matches['prefix']  # e.g. "2025-02-26 08:46:00.000"
+                        $timeVal       = [int]$Matches['time']
+                        $rest          = $Matches['rest']    # e.g. " | Avg: 61.32 ms | Min: 35 ms | Max: 167 ms"
+
+                        # Write the server name in its color
+                        Write-Host -NoNewLine "[" -ForegroundColor "White"
+                        Write-Host -NoNewLine $serverName -ForegroundColor $serverColor
+                        Write-Host -NoNewLine "] " -ForegroundColor "White"
+
+                        # Date/time portion in white
+                        Write-Host -NoNewLine $dateAndPrefix -ForegroundColor "White"
+                        Write-Host -NoNewLine " - Response time: " -ForegroundColor "White"
+
+                        # Numeric response time in red or green
+                        if ($timeVal -gt 150) {
+                            Write-Host -NoNewLine "$timeVal ms" -ForegroundColor "Red"
+                        }
+                        else {
+                            Write-Host -NoNewLine "$timeVal ms" -ForegroundColor "Green"
+                        }
+
+                        # The rest (Avg/Min/Max) in the server's color
+                        Write-Host $rest -ForegroundColor $serverColor
+                    }
+                    else {
+                        # If we can't parse the line with the regex, just print everything in white plus the server name
+                        Write-Host "[$serverName] $parsedMessage" -ForegroundColor "White"
+                    }
                 }
             }
             Start-Sleep -Milliseconds 100
         }
 
-        # Output the summary results of all tests
+        # Return the summary
         Write-Output $resultBag
     }
 
     End {
-        # Cleanup and finalize by disposing runspaces
+        # Cleanup
         foreach ($runspace in $runspaces) {
             $runspace.Pipe.EndInvoke($runspace.Handle)
             $runspace.Pipe.Dispose()
         }
-
         $runspacePool.Close()
     }
 }
