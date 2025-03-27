@@ -28,7 +28,7 @@ function Show-MessageBox {
 
     .PARAMETER Timeout
         (Optional) Time in seconds before the message box automatically closes.
-        If set to 0, the message box will not close automatically.
+        Must be a non-negative integer. If set to 0, the message box will not close automatically.
 
     .EXAMPLE
         Show-MessageBox "An error occurred." "Error" -Icon Error
@@ -43,8 +43,8 @@ function Show-MessageBox {
         Name: Show-MessageBox
         Author: Ryan Whitlock
         Date: 03.05.2025
-        Version: 1.0
-        Changes: Initial release
+        Version: 1.1
+        Changes: Added Timeout validation, improved assembly check
     #>
 
     [CmdletBinding()]
@@ -66,18 +66,17 @@ function Show-MessageBox {
         [System.Windows.Forms.MessageBoxDefaultButton]$DefaultButton = [System.Windows.Forms.MessageBoxDefaultButton]::Button1,
 
         [Parameter(Position=5)]
+        [ValidateRange(0, [int]::MaxValue)]
         [int]$Timeout = 0
     )
 
     begin {
         # Load Windows Forms only if not already loaded
-        if (-not [System.AppDomain]::CurrentDomain.GetAssemblies().FullName -match "System.Windows.Forms") {
+        if (-not ([System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq "System.Windows.Forms" })) {
             Add-Type -AssemblyName System.Windows.Forms
-        }        
+        }
 
         function Get-ActiveScreenCenter {
-            Add-Type -AssemblyName System.Windows.Forms
-
             # Get the current mouse position
             [System.Drawing.Point]$MousePosition = [System.Windows.Forms.Cursor]::Position  
 
