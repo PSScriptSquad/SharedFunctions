@@ -1,1481 +1,2587 @@
+# =======================================================================
+# Kerberos Diagnostic Module
+#
+# This script contains a suite of functions for diagnosing and testing
+# Kerberos authentication from a client's perspective.
+#
+# To execute, load the script into memory and then call:
+# Test-AdvancedKerberos -DomainController "your-dc.your-domain.com"
+# =======================================================================
+
+#-----------------------------------------------------------------------
+# SECTION 1: Private Helper Functions
+# Private Helper Functions for ASN.1 and Kerberos Packet Handling
+#-----------------------------------------------------------------------
+function New-Asn1Length {
+	param([int]$Length)
+	if ($Length -lt 128) {
+		return @([byte]$Length)
+	}
+	else {
+		$bytes = @()
+		$temp = $Length
+		while ($temp -gt 0) {
+			$bytes = ,([byte]($temp -band 0xFF)) + $bytes
+			$temp = $temp -shr 8
+		}
+		$prefixByte = [byte](0x80 + $bytes.Length)
+		return ,$prefixByte + $bytes
+	}
+}
+
+function New-Asn1Integer {
+	param([int]$Value)
+	if ($Value -eq 0) {
+		$intBytes = @([byte]0)
+	}
+	else {
+		$absVal = [Math]::Abs($Value)
+		$bytes = @()
+		while ($absVal -gt 0) {
+			$bytes = ,([byte]($absVal -band 0xFF)) + $bytes
+			$absVal = $absVal -shr 8
+		}
+		if ($Value -ge 0 -and ($bytes[0] -band 0x80)) {
+			$bytes = ,([byte]0) + $bytes
+		}
+		$intBytes = $bytes
+	}
+	$lenBytes = New-Asn1Length $intBytes.Length
+	return ,([byte]0x02) + $lenBytes + $intBytes
+}
+
+function New-Asn1BitString {
+	param([byte[]]$Bits)
+	if (-not $Bits -or $Bits.Length -le 0) {
+		throw "BitString data cannot be null or empty"
+	}
+	$unusedBits = 0
+	$content = ,([byte]$unusedBits) + $Bits
+	$lenBytes = New-Asn1Length $content.Length
+	return ,([byte]0x03) + $lenBytes + $content
+}
+
+function New-Asn1KerberosTime {
+	param([DateTime]$Time)
+	$timeStr = $Time.ToUniversalTime().ToString("yyyyMMddHHmmssZ")
+	$bytes = [Text.Encoding]::ASCII.GetBytes($timeStr)
+	$lenBytes = New-Asn1Length $bytes.Length
+	return ,([byte]0x18) + $lenBytes + $bytes
+}
+
+function New-Asn1KerberosString {
+	param([string]$Str)
+	if ([string]::IsNullOrEmpty($Str)) {
+		throw "Kerberos string cannot be null or empty"
+	}
+	$bytes = [Text.Encoding]::ASCII.GetBytes($Str)
+	$lenBytes = New-Asn1Length $bytes.Length
+	return ,([byte]0x1B) + $lenBytes + $bytes
+}
+
+function New-Asn1Sequence {
+	param(
+		[Parameter(Mandatory)]
+		[byte[]]$ContentBytes
+	)
+	$lenBytes = New-Asn1Length $ContentBytes.Length
+	return ,([byte]0x30) + $lenBytes + $ContentBytes
+}
+
+function New-Asn1SequenceOf {
+	param(
+		[Parameter(Mandatory)]
+		[byte[][]]$Elements
+	)
+	$aggregate = @()
+	$aggregate = foreach ($el in $Elements) {
+        $el
+	}
+	return New-Asn1Sequence -ContentBytes $aggregate
+}
+
+function New-KerberosPrincipalArray {
+	param([string]$PrincipalName)
+	$parts = $PrincipalName.Split('/')
+	if ($parts.Count -eq 0) {
+		throw "PrincipalName cannot be empty"
+	}
+	$out = @()
+	foreach ($component in $parts) {
+		if (-not [string]::IsNullOrEmpty($component)) {
+			$out += New-Asn1KerberosString $component
+		}
+		else {
+			throw "Empty component in principal: '$PrincipalName'"
+		}
+	}
+	return $out
+}
+
+function New-KerberosPrincipalName {
+	param(
+		[Parameter(Mandatory)]
+		[string]$Name,
+		[int]$NameType = 1
+	)
+	$ntBytes = New-Asn1Integer $NameType
+	$ntSection = ,([byte]0xA0) + (New-Asn1Length $ntBytes.Length) + $ntBytes
+
+	$stringElems = New-KerberosPrincipalArray -PrincipalName $Name
+	$stringSeq = New-Asn1SequenceOf $stringElems
+	$nsSection = ,([byte]0xA1) + (New-Asn1Length $stringSeq.Length) + $stringSeq
+
+	$combined = $ntSection + $nsSection
+	return New-Asn1Sequence -ContentBytes $combined
+}
+
+function New-KerberosAsReqPacket {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+		[string]$ClientName,
+		[Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+		[string]$Realm,
+		[string]$ServerName = $null,
+		[DateTime]$TillTime,
+		[int[]]$EncryptionTypes = @(18, 17, 23)
+	)
+	if ([string]::IsNullOrWhiteSpace($ServerName)) {
+		$ServerName = "krbtgt/$Realm"
+	}
+
+	[int]$Nonce = (Get-Random)
+
+	$zeroBytes = [byte[]](0, 0, 0, 0)
+	$kdcOptionsBytes = New-Asn1BitString -Bits $zeroBytes
+	$kdcOptionsSec = ,([byte]0xA0) + (New-Asn1Length $kdcOptionsBytes.Length) + $kdcOptionsBytes
+
+	$cnameBytes = New-KerberosPrincipalName -Name $ClientName -NameType 1
+	$cnameSection = ,([byte]0xA1) + (New-Asn1Length $cnameBytes.Length) + $cnameBytes
+
+	$realmBytes = New-Asn1KerberosString -Str $Realm
+	$realmSection = ,([byte]0xA2) + (New-Asn1Length $realmBytes.Length) + $realmBytes
+
+	$snameBytes = New-KerberosPrincipalName -Name $ServerName -NameType 2
+	$snameSection = ,([byte]0xA3) + (New-Asn1Length $snameBytes.Length) + $snameBytes
+
+	$tillBytes = New-Asn1KerberosTime -Time $TillTime
+	$tillSection = ,([byte]0xA5) + (New-Asn1Length $tillBytes.Length) + $tillBytes
+
+	$nonceBytes = New-Asn1Integer -Value $nonce
+	$nonceSection = ,([byte]0xA7) + (New-Asn1Length $nonceBytes.Length) + $nonceBytes
+
+	$etypeInts = foreach ($e in $EncryptionTypes) { New-Asn1Integer -Value $e }
+	$etypeSeq = New-Asn1SequenceOf -Elements $etypeInts
+	$etypeSection = ,([byte]0xA8) + (New-Asn1Length $etypeSeq.Length) + $etypeSeq
+
+	$reqBodyContent = $kdcOptionsSec + $cnameSection + $realmSection + $snameSection + $tillSection + $nonceSection + $etypeSection
+	$reqBodySeq = New-Asn1Sequence -ContentBytes $reqBodyContent
+	$reqBodySection = ,([byte]0xA4) + (New-Asn1Length $reqBodySeq.Length) + $reqBodySeq
+
+	$pvnoBytes = New-Asn1Integer -Value 5
+	$pvnoSection = ,([byte]0xA1) + (New-Asn1Length $pvnoBytes.Length) + $pvnoBytes
+
+	$msgTypeBytes = New-Asn1Integer -Value 10 # AS-REQ
+	$msgTypeSection = ,([byte]0xA2) + (New-Asn1Length $msgTypeBytes.Length) + $msgTypeBytes
+
+	$kdcReqContent = $pvnoSection + $msgTypeSection + $reqBodySection
+	$kdcReqSeq = New-Asn1Sequence -ContentBytes $kdcReqContent
+
+	$lengthBytes = New-Asn1Length $kdcReqSeq.Length
+	return ,([byte]0x6A) + $lengthBytes + $kdcReqSeq
+}
+
+function ConvertFrom-Asn1 {
+	param([byte[]]$Data)
+
+	function Parse-Node {
+		param(
+			[byte[]]$Bytes,
+			[int]$Offset
+		)
+		$originalOffset = $Offset
+		$node = [PSCustomObject]@{
+			Tag = $null; TagName = 'UNKNOWN'; Length = 0; Value = $null
+			RawValueBytes = $null; Offset = $originalOffset; TotalBytes = 0
+		}
+
+		# 1. Parse Tag
+		$tagByte = $Bytes[$Offset++]
+		$node.Tag = $tagByte
+		$isConstructed = ($tagByte -band 0x20) -ne 0
+		$tagClass = $tagByte -shr 6
+		$tagNumber = $tagByte -band 0x1F
+		$node.TagName = switch ($tagClass) {
+			0 { # Universal
+				switch ($tagNumber) {
+					2 { 'INTEGER' }
+					3 { 'BIT STRING' }
+					4 { 'OCTET STRING' }
+					5 { 'NULL' }
+					16 { 'SEQUENCE' }
+					17 { 'SET' }
+					18 { 'GeneralString' }
+					24 { 'GeneralizedTime' }
+					default { "Universal[$tagNumber]" }
+				}
+			}
+			2 { "ContextSpecific[$tagNumber]" }
+			1 { "Application[$tagNumber]" }
+			3 { "Private[$tagNumber]" }
+		}
+		if ($isConstructed) {
+			$node.TagName += " (Constructed)"
+		}
+
+		# 2. Parse Length
+		$lenByte = $Bytes[$Offset++]
+		if ($lenByte -band 0x80) { # Long form
+			$numLenBytes = $lenByte -band 0x7F
+			if (($Offset + $numLenBytes) -gt $Bytes.Length) { throw "ASN.1 parse error: Invalid length field." }
+			for ($i = 0; $i -lt $numLenBytes; $i++) {
+				$node.Length = ($node.Length -shl 8) + $Bytes[$Offset++]
+			}
+		}
+		else { # Short form
+			$node.Length = $lenByte
+		}
+
+		# 3. Parse Value
+		$valueOffset = $Offset
+		if (($valueOffset + $node.Length) -gt $Bytes.Length) { throw "ASN.1 parse error: Length exceeds data boundary." }
+		$node.RawValueBytes = $Bytes[$valueOffset..($valueOffset + $node.Length - 1)]
+		$Offset += $node.Length
+
+		if ($isConstructed) {
+			$node.Value = [System.Collections.ArrayList]@()
+			$childOffset = 0
+			while ($childOffset -lt $node.Length) {
+				$childNode, $childBytesConsumed = Parse-Node -Bytes $node.RawValueBytes -Offset $childOffset
+				[void]$node.Value.Add($childNode)
+				$childOffset += $childBytesConsumed
+			}
+		}
+		else {
+			switch ($node.TagName) {
+				'INTEGER' {
+					$reversed = [byte[]]($node.RawValueBytes); [System.Array]::Reverse($reversed)
+					if (($node.RawValueBytes[0] -band 0x80) -ne 0 -and $node.RawValueBytes.Length -gt 0) {
+						$newBytes = [byte[]]::new($reversed.Length + 1); [System.Array]::Copy($reversed, 0, $newBytes, 0, $reversed.Length); $reversed = $newBytes
+					}
+					$node.Value = [System.Numerics.BigInteger]::new($reversed)
+				}
+				{ ($_ -eq 'GeneralString') -or ($_ -eq 'GeneralizedTime') } {
+					$node.Value = [System.Text.Encoding]::ASCII.GetString($node.RawValueBytes)
+				}
+				default {
+					$node.Value = ($node.RawValueBytes | ForEach-Object { $_.ToString('X2') }) -join ''
+				}
+			}
+		}
+		$node.TotalBytes = $Offset - $originalOffset
+		return $node, $node.TotalBytes
+	}
+	$parsed, $bytesConsumed = Parse-Node -Bytes $Data -Offset 0
+	return $parsed
+}
+
+function Find-Asn1NodeByTagPath {
+	param($Node, [int[]]$TagPath)
+	$currentNode = $Node
+	foreach ($tagNumber in $TagPath) {
+		if (-not $currentNode -or -not $currentNode.Value -is [System.Collections.ArrayList]) {
+			return $null
+		}
+		$foundChild = $currentNode.Value | Where-Object { ($_.Tag -band 0x1F) -eq ($tagNumber -band 0x1F) } | Select-Object -First 1
+		if (-not $foundChild) {
+			return $null
+		}
+		$currentNode = $foundChild
+	}
+	return $currentNode
+}        
+
+function Get-KerberosErrorDescription {
+	param([int]$ErrorCode)
+	$map = @{
+		1 = "KDC_ERR_NAME_EXP - Client expired"
+		2 = "KDC_ERR_SERVICE_EXP - Server expired"
+		3 = "KDC_ERR_BAD_PVNO - Bad protocol version"
+		6 = "KDC_ERR_C_PRINCIPAL_UNKNOWN - Client not found"
+		7 = "KDC_ERR_S_PRINCIPAL_UNKNOWN - Server not found"
+		8 = "KDC_ERR_PRINCIPAL_NOT_UNIQUE - Multiple entries"
+		12 = "KDC_ERR_NEVER_VALID - Ticket not yet valid"
+		18 = "KDC_ERR_CLIENT_REVOKED"
+		23 = "KDC_ERR_KEY_EXPIRED"
+		24 = "KDC_ERR_PREAUTH_FAILED"
+		25 = "KDC_ERR_PREAUTH_REQUIRED"
+		32 = "KDC_ERR_SKEW - Clock skew too great"
+		68 = "KDC_ERR_WRONG_REALM"
+	}
+
+	if ($map.ContainsKey($ErrorCode)) {
+		return $map[$ErrorCode]
+	}
+	else {
+		return "Unknown error code: $ErrorCode"
+	}
+}
+
+function Get-KerberosResponseAnalysis {
+	param([byte[]]$ResponseBytes)
+	$analysis = [pscustomobject]@{ Type = 'UNKNOWN'; IsSuccess = $false; ErrorCode = $null; ErrorDescription = 'Response was not a valid AS-REP or KRB-ERROR.' }
+	if (-not $ResponseBytes -or $ResponseBytes.Length -lt 2) {
+		$analysis.Type = 'EMPTY_RESPONSE'
+		$analysis.ErrorDescription = 'No response data received from KDC.'
+		return $analysis
+	}
+	$parsedResponse = ConvertFrom-Asn1 -Data $ResponseBytes
+	switch ($parsedResponse.Tag) {
+		0x6B {
+			$analysis.Type = 'AS-REP'
+			$analysis.IsSuccess = $true
+			$analysis.ErrorDescription = 'Authentication successful (AS-REP received).'
+		}
+		0x7E {
+			$analysis.Type = 'KRB-ERROR'
+			$errorCodeNode = Find-Asn1NodeByTagPath -Node $parsedResponse -TagPath @(0x30, 0xA6, 0x02)
+			$errorCode = if ($errorCodeNode) { [int]$errorCodeNode.Value } else { $null }
+			$analysis.ErrorCode = $errorCode
+			$analysis.ErrorDescription = Get-KerberosErrorDescription $errorCode
+			if ($errorCode -eq 25) {
+				$analysis.IsSuccess = $true
+			}
+		}
+	}
+	return $analysis
+}
+
+#-----------------------------------------------------------------------
+# Helper Functions for Test-TgtRequest
+#-----------------------------------------------------------------------
+function Test-KerberosSpn {
+    <#
+    .SYNOPSIS
+        Checks for the registration of a Service Principal Name (SPN) in Active Directory.
+    .PARAMETER Spn
+        The Service Principal Name to check. Example: "HTTP/web.contoso.com".
+    .EXAMPLE
+        Test-KerberosSpn -Spn "HOST/dc01.contoso.com"
+    .OUTPUTS
+        System.String
+        A status string: "SKIPPED", "MISSING", "DUPLICATE", "OK", or "CHECK_FAILED".
+    .NOTES
+        Requires the Microsoft Active Directory module. This is intended as an internal
+        helper function for other Kerberos tests.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Spn
+    )
+
+    # Check if the AD module is available before trying to use its cmdlets.
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        return "SKIPPED (ActiveDirectory module not available)"
+    }
+
+    try {
+        # Search for any account (user or computer) with the specified SPN.
+        $adObjects = Get-ADObject -Filter "ServicePrincipalName -eq '$Spn'" -ErrorAction Stop
+        
+        if ($null -eq $adObjects) {
+            return "MISSING - The SPN '$Spn' is not registered on any account."
+        }
+        
+        if (($adObjects | Measure-Object).Count -gt 1) {
+            $accounts = ($adObjects.DistinguishedName) -join ', '
+            return "DUPLICATE - The SPN '$Spn' is registered on multiple accounts: $accounts"
+        }
+
+        return "OK - Registered to '$($adObjects.DistinguishedName)'"
+    }
+    catch {
+        return "CHECK_FAILED - An error occurred while querying Active Directory: $($_.Exception.Message)"
+    }
+}
+
+#-----------------------------------------------------------------------
+# Helper Functions for Test-TgsAndSpnValidation
+#-----------------------------------------------------------------------
+function Get-TicketFlags {
+    param([int]$Flags)
+
+    $flagNames = @()
+    if ($flags -band 0x40000000) { $flagNames += "forwardable" }
+    if ($flags -band 0x20000000) { $flagNames += "forwarded" }
+    if ($flags -band 0x10000000) { $flagNames += "proxiable" }
+    if ($flags -band 0x08000000) { $flagNames += "proxy" }
+    if ($flags -band 0x04000000) { $flagNames += "allow_postdate" }
+    if ($flags -band 0x02000000) { $flagNames += "postdated" }
+    if ($flags -band 0x01000000) { $flagNames += "invalid" }
+    if ($flags -band 0x00800000) { $flagNames += "renewable" }
+    if ($flags -band 0x00400000) { $flagNames += "initial" }
+    if ($flags -band 0x00200000) { $flagNames += "pre_authent" }
+    if ($flags -band 0x00100000) { $flagNames += "hw_authent" }
+    if ($flags -band 0x00080000) { $flagNames += "ok_as_delegate" }
+    if ($flags -band 0x00040000) { $flagNames += "anonymous" }
+    if ($flags -band 0x00020000) { $flagNames += "enc_pa_rep" }
+    if ($flags -band 0x00010000) { $flagNames += "name_canonicalize" }
+    return $flagNames -join " "
+}
+
+function Get-CacheFlags {
+    param([int]$Flags)
+    $flagNames = @()
+    if ($flags -band 0x1) { $flagNames += "PRIMARY" }
+    if ($flags -band 0x2) { $flagNames += "DELEGATION" }
+    if ($flags -band 0x4) { $flagNames += "S4U" }
+    if ($flags -band 0x8) { $flagNames += "ASC_GSS_CONTEXT" }
+    return $flagNames -join " "
+}
+
+function Parse-KerbExternalName {
+    param(
+        [IntPtr]$nameStructPtr
+    )
+
+    if ($nameStructPtr -eq [IntPtr]::Zero) { return "" }
+
+    try {
+        # Read the first two fields of KERB_EXTERNAL_NAME
+        $nameType = [System.Runtime.InteropServices.Marshal]::ReadInt16($nameStructPtr)
+        $nameCount = [System.Runtime.InteropServices.Marshal]::ReadInt16($nameStructPtr, 2)
+        
+        if ($nameCount -eq 0) { return "" }
+
+        $names = @()
+        # Start reading UNICODE_STRING array immediately after the header (4 bytes)
+        $usArrayPtr = [IntPtr]($nameStructPtr.ToInt64() + 4)
+        $sizeOfUnicodeString = 8  # UNICODE_STRING is 8 bytes (Length:2, MaxLength:2, Buffer:4/8)
+        
+        # Determine if we're on 64-bit (Buffer pointer is 8 bytes) or 32-bit (4 bytes)
+        $is64Bit = [IntPtr]::Size -eq 8
+        if ($is64Bit) {
+            $sizeOfUnicodeString = 16  # Length:2, MaxLength:2, Padding:4, Buffer:8
+        }
+
+        for ($j = 0; $j -lt $nameCount; $j++) {
+            $currentUsPtr = [IntPtr]($usArrayPtr.ToInt64() + ($j * $sizeOfUnicodeString))
+            
+            # Read UNICODE_STRING fields manually
+            $length = [System.Runtime.InteropServices.Marshal]::ReadInt16($currentUsPtr)
+            $maxLength = [System.Runtime.InteropServices.Marshal]::ReadInt16($currentUsPtr, 2)
+            
+            # Buffer pointer location depends on architecture
+            $bufferPtr = if ($is64Bit) {
+                [System.Runtime.InteropServices.Marshal]::ReadIntPtr($currentUsPtr, 8)
+            } else {
+                [System.Runtime.InteropServices.Marshal]::ReadIntPtr($currentUsPtr, 4)
+            }
+
+            if ($bufferPtr -ne [IntPtr]::Zero -and $length -gt 0) {
+                $nameString = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($bufferPtr, $length / 2)
+                if ($nameString) {
+                    $names += $nameString
+                }
+            }
+        }
+        return $names -join "/"
+    }
+    catch {
+        Write-Verbose "Could not parse KERB_EXTERNAL_NAME at address $($nameStructPtr): $_"
+        return ""
+    }
+}
+
+function Get-KerberosTicket {
+    <#
+    .SYNOPSIS
+        Retrieves Kerberos tickets from the current user's ticket cache via the native LSA API.
+    .DESCRIPTION
+        Calls into Secur32.dll and Advapi32.dll with P/Invoke (via Add-Type) to query the
+        Kerberos authentication package for cached tickets. Returns structured objects
+        rather than parsing klist.exe output. Enhanced to include Session Key Type and
+        additional ticket details like Client Name and Service Name.
+    .OUTPUTS
+        System.Management.Automation.PSCustomObject
+    .NOTES
+        - Does not require SeTcbPrivilege by using LsaConnectUntrusted and LogonId=0.
+        - Tested on PowerShell 5.1 / Windows 10+.
+        - Retrieving full ticket details may impact performance for many tickets.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $TokenQuery = 0x0008
+    $signature = @"
+    using System;
+    using System.Runtime.InteropServices;
+
+    public class Secur32 {
+        [DllImport("Secur32.dll", SetLastError = false)]
+        public static extern uint LsaConnectUntrusted(out IntPtr LsaHandle);
+        
+        [DllImport("Secur32.dll", SetLastError = false)]
+        public static extern uint LsaLookupAuthenticationPackage(
+            IntPtr LsaHandle, 
+            ref LSA_STRING PackageName, 
+            out uint AuthenticationPackage
+        );
+        
+        [DllImport("secur32.dll", SetLastError = false)]
+        public static extern uint LsaCallAuthenticationPackage(
+            IntPtr LsaHandle, 
+            uint AuthenticationPackage, 
+            IntPtr ProtocolSubmitBuffer, 
+            uint SubmitBufferLength, 
+            out IntPtr ProtocolReturnBuffer, 
+            out uint ReturnBufferLength, 
+            out uint ProtocolStatus
+        );
+        
+        [DllImport("secur32.dll", SetLastError = false)]
+        public static extern uint LsaDeregisterLogonProcess(IntPtr LsaHandle);
+        
+        [DllImport("secur32.dll", SetLastError = false)]
+        public static extern uint LsaFreeReturnBuffer(IntPtr buffer);
+        
+        [DllImport("advapi32.dll", SetLastError = false)]
+        public static extern bool GetTokenInformation(
+            IntPtr TokenHandle, 
+            TOKEN_INFORMATION_CLASS TokenInformationClass, 
+            IntPtr TokenInformation, 
+            uint TokenInformationLength, 
+            out uint ReturnLength
+        );
+        
+        [DllImport("kernel32.dll", SetLastError = false)]
+        public static extern IntPtr GetCurrentProcess();
+        
+        [DllImport("advapi32.dll", SetLastError = false)]
+        public static extern bool OpenProcessToken(
+            IntPtr ProcessHandle, 
+            uint DesiredAccess, 
+            out IntPtr TokenHandle
+        );
+        
+        [DllImport("kernel32.dll", SetLastError = false)]
+        public static extern bool CloseHandle(IntPtr handle);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LSA_STRING { 
+        public ushort Length; 
+        public ushort MaximumLength; 
+        public IntPtr Buffer; 
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct UNICODE_STRING { 
+        public ushort Length; 
+        public ushort MaximumLength; 
+        public IntPtr Buffer; 
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct KERB_QUERY_TKT_CACHE_REQUEST { 
+        public KERB_PROTOCOL_MESSAGE_TYPE MessageType; 
+        public LUID LogonId; 
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct KERB_QUERY_TKT_CACHE_RESPONSE { 
+        public KERB_PROTOCOL_MESSAGE_TYPE MessageType; 
+        public uint CountOfTickets; 
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID { 
+        public uint LowPart; 
+        public int HighPart; 
+    }
+
+    public enum KERB_PROTOCOL_MESSAGE_TYPE : uint {
+        KerbQueryTicketCacheMessage = 1,
+        KerbRetrieveEncodedTicketMessage = 8
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    public struct KERB_TICKET_CACHE_INFO {
+        public UNICODE_STRING ServerName; 
+        public UNICODE_STRING RealmName;
+        public long StartTime; 
+        public long EndTime; 
+        public long RenewTime;
+        public int EncryptionType; 
+        public uint TicketFlags;
+    }
+
+    public enum TOKEN_INFORMATION_CLASS { 
+        TokenStatistics = 10 
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TOKEN_STATISTICS {
+        public LUID TokenId; 
+        public LUID AuthenticationId; 
+        public long ExpirationTime;
+        public uint TokenType; 
+        public uint ImpersonationLevel; 
+        public uint DynamicCharged;
+        public uint DynamicAvailable; 
+        public uint GroupCount; 
+        public uint PrivilegeCount;
+        public LUID ModifiedId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SecHandle { 
+        public IntPtr dwLower; 
+        public IntPtr dwUpper; 
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KERB_RETRIEVE_TKT_REQUEST {
+        public KERB_PROTOCOL_MESSAGE_TYPE MessageType; 
+        public LUID LogonId;
+        public UNICODE_STRING TargetName; 
+        public uint TicketFlags; 
+        public uint CacheOptions;
+        public int EncryptionType; 
+        public SecHandle CredentialsHandle;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KERB_RETRIEVE_TKT_RESPONSE { 
+        public KERB_EXTERNAL_TICKET Ticket; 
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KERB_CRYPTO_KEY { 
+        public int KeyType; 
+        public uint Length; 
+        public IntPtr Value; 
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KERB_EXTERNAL_TICKET {
+        public IntPtr ServiceName; 
+        public IntPtr TargetName; 
+        public IntPtr ClientName;
+        public UNICODE_STRING DomainName; 
+        public UNICODE_STRING TargetDomainName; 
+        public UNICODE_STRING AltTargetDomainName;
+        public KERB_CRYPTO_KEY SessionKey; 
+        public uint TicketFlags; 
+        public uint Flags;
+        public long KeyExpirationTime; 
+        public long StartTime; 
+        public long EndTime; 
+        public long RenewUntil;
+        public long TimeSkew; 
+        public uint EncodedTicketSize; 
+        public IntPtr EncodedTicket;
+    }
+"@
+    Add-Type -TypeDefinition $signature -Language CSharp -ErrorAction Stop
+
+    $encryptionMap = @{
+        1  = "DES-CBC-CRC"
+        3  = "DES-CBC-MD5"
+        17 = "AES-128-CTS-HMAC-SHA1-96"
+        18 = "AES-256-CTS-HMAC-SHA1-96"
+        23 = "RC4-HMAC"
+        24 = "RC4-HMAC-EXP"
+    }
+
+    $lsaHandle = [IntPtr]::Zero
+    $pReq = [IntPtr]::Zero
+    $returnBuffer = [IntPtr]::Zero
+    $kerbNameBuf = [IntPtr]::Zero
+    $tokenHandle = [IntPtr]::Zero
+
+    try {
+        $status = [Secur32]::LsaConnectUntrusted([ref]$lsaHandle)
+        if ($status -ne 0) { 
+            throw "LsaConnectUntrusted failed: 0x$($status.ToString('X8'))" 
+        }
+
+        $kerbName = "kerberos"
+        $kerbPkg = New-Object LSA_STRING
+        $kerbNameBuf = [System.Runtime.InteropServices.Marshal]::StringToHGlobalAnsi($kerbName)
+        $kerbPkg.Buffer = $kerbNameBuf
+        $kerbPkg.Length = [System.Text.Encoding]::ASCII.GetByteCount($kerbName)
+        $kerbPkg.MaximumLength = $kerbPkg.Length + 1
+        
+        $authPkg = 0
+        $status = [Secur32]::LsaLookupAuthenticationPackage($lsaHandle, [ref]$kerbPkg, [ref]$authPkg)
+        if ($status -ne 0) { 
+            throw "LsaLookupAuthenticationPackage failed: 0x$($status.ToString('X8'))" 
+        }
+
+        $req = New-Object KERB_QUERY_TKT_CACHE_REQUEST
+        $req.MessageType = [KERB_PROTOCOL_MESSAGE_TYPE]::KerbQueryTicketCacheMessage
+        $req.LogonId = New-Object LUID
+        
+        $reqSize = [System.Runtime.InteropServices.Marshal]::SizeOf($req)
+        $pReq = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($reqSize)
+        [System.Runtime.InteropServices.Marshal]::StructureToPtr($req, $pReq, $false)
+
+        $protStatus = 0
+        $returnedLen = 0
+        $status = [Secur32]::LsaCallAuthenticationPackage(
+            $lsaHandle, 
+            $authPkg, 
+            $pReq, 
+            [uint32]$reqSize, 
+            [ref]$returnBuffer, 
+            [ref]$returnedLen, 
+            [ref]$protStatus
+        )
+        if ($status -ne 0) { 
+            throw "LsaCallAuthenticationPackage failed: 0x$($status.ToString('X8'))" 
+        }
+
+        if ($returnBuffer -eq [IntPtr]::Zero -or $returnedLen -eq 0) { 
+            Write-Verbose "No tickets returned"
+            return @() 
+        }
+
+        $hdr = [System.Runtime.InteropServices.Marshal]::PtrToStructure($returnBuffer, [System.Type][KERB_QUERY_TKT_CACHE_RESPONSE])
+        if ($hdr.CountOfTickets -eq 0) { 
+            return @() 
+        }
+
+        $tickets = for ($i = 0; $i -lt $hdr.CountOfTickets; $i++) {
+            $thisPtr = [IntPtr](
+                $returnBuffer.ToInt64() + 
+                [System.Runtime.InteropServices.Marshal]::SizeOf([System.Type][KERB_QUERY_TKT_CACHE_RESPONSE]) + 
+                ($i * [System.Runtime.InteropServices.Marshal]::SizeOf([System.Type][KERB_TICKET_CACHE_INFO]))
+            )
+            $info = [System.Runtime.InteropServices.Marshal]::PtrToStructure($thisPtr, [System.Type][KERB_TICKET_CACHE_INFO])
+
+            $ticketReqPtr = [IntPtr]::Zero
+            $ticketReturnBuffer = [IntPtr]::Zero
+            $ticketTargetNameBuf = [IntPtr]::Zero
+            
+            try {
+                $ticketReq = New-Object KERB_RETRIEVE_TKT_REQUEST
+                $ticketReq.MessageType = [KERB_PROTOCOL_MESSAGE_TYPE]::KerbRetrieveEncodedTicketMessage
+                $ticketReq.LogonId = New-Object LUID
+                $ticketReq.CacheOptions = 0x00000002 # KERB_RETRIEVE_TICKET_USE_CACHE_ONLY
+
+                $serverName = if ($info.ServerName.Buffer -ne [IntPtr]::Zero -and $info.ServerName.Length) { 
+                    [System.Runtime.InteropServices.Marshal]::PtrToStringUni($info.ServerName.Buffer, $info.ServerName.Length/2) 
+                } else { 
+                    "" 
+                }
+                
+                if ($serverName) {
+                    $ticketTargetNameBuf = [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($serverName)
+                    $ticketReq.TargetName = New-Object UNICODE_STRING
+                    $ticketReq.TargetName.Length = $serverName.Length * 2
+                    $ticketReq.TargetName.MaximumLength = $ticketReq.TargetName.Length + 2
+                    $ticketReq.TargetName.Buffer = $ticketTargetNameBuf
+                }
+
+                $ticketReqSize = [System.Runtime.InteropServices.Marshal]::SizeOf($ticketReq)
+                $ticketReqPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($ticketReqSize)
+                [System.Runtime.InteropServices.Marshal]::StructureToPtr($ticketReq, $ticketReqPtr, $false)
+
+                $ticketProtStatus = 0 
+                $ticketReturnedLen = 0
+                $status = [Secur32]::LsaCallAuthenticationPackage(
+                    $lsaHandle, 
+                    $authPkg, 
+                    $ticketReqPtr, 
+                    [uint32]$ticketReqSize, 
+                    [ref]$ticketReturnBuffer, 
+                    [ref]$ticketReturnedLen, 
+                    [ref]$ticketProtStatus
+                )
+
+                Write-Verbose "Ticket retrieval for $serverName - Status: 0x$($status.ToString('X8')), ProtStatus: 0x$($ticketProtStatus.ToString('X8')), BufferLen: $ticketReturnedLen"
+                
+                if ($status -eq 0 -and $ticketProtStatus -eq 0 -and $ticketReturnBuffer -ne [IntPtr]::Zero) {
+                    $response = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ticketReturnBuffer, [System.Type][KERB_RETRIEVE_TKT_RESPONSE])
+                    $ticketExt = $response.Ticket
+
+                    # Get session key type
+                    $sessionKeyType = if ($encryptionMap[$ticketExt.SessionKey.KeyType]) { 
+                        $encryptionMap[$ticketExt.SessionKey.KeyType] 
+                    } else { 
+                        "Unknown ($($ticketExt.SessionKey.KeyType))" 
+                    }
+                    
+                    # Parse the external names using the fixed helper function
+                    $clientName = Parse-KerbExternalName -nameStructPtr $ticketExt.ClientName
+                    $serviceName = Parse-KerbExternalName -nameStructPtr $ticketExt.ServiceName
+
+                    # Parse domain names from UNICODE_STRING structures
+                    $domainName = if ($ticketExt.DomainName.Buffer -ne [IntPtr]::Zero -and $ticketExt.DomainName.Length) {
+                        [System.Runtime.InteropServices.Marshal]::PtrToStringUni($ticketExt.DomainName.Buffer, $ticketExt.DomainName.Length/2)
+                    } else { 
+                        "" 
+                    }
+
+                    $targetDomainName = if ($ticketExt.TargetDomainName.Buffer -ne [IntPtr]::Zero -and $ticketExt.TargetDomainName.Length) {
+                        [System.Runtime.InteropServices.Marshal]::PtrToStringUni($ticketExt.TargetDomainName.Buffer, $ticketExt.TargetDomainName.Length/2)
+                    } else { 
+                        "" 
+                    }
+
+                    $altTargetDomainName = if ($ticketExt.AltTargetDomainName.Buffer -ne [IntPtr]::Zero -and $ticketExt.AltTargetDomainName.Length) {
+                        [System.Runtime.InteropServices.Marshal]::PtrToStringUni($ticketExt.AltTargetDomainName.Buffer, $ticketExt.AltTargetDomainName.Length/2)
+                    } else { 
+                        "" 
+                    }
+
+                    # Get realm name from basic cache info if detailed domains are empty
+                    $realmName = if ($info.RealmName.Buffer -ne [IntPtr]::Zero -and $info.RealmName.Length) { 
+                        [System.Runtime.InteropServices.Marshal]::PtrToStringUni($info.RealmName.Buffer, $info.RealmName.Length/2) 
+                    } else { 
+                        "" 
+                    }
+
+                    # Enhanced KDC Called logic - try multiple sources
+                    $kdcCalled = ""
+                    if ($altTargetDomainName) {
+                        $kdcCalled = $altTargetDomainName
+                    } elseif ($targetDomainName) {
+                        $kdcCalled = $targetDomainName
+                    } elseif ($realmName) {
+                        $kdcCalled = $realmName
+                    }
+                    
+                    # If still empty, try to extract from server name
+                    if (!$kdcCalled -and $serverName) {
+                        $serverParts = $serverName.Split('/')
+                        if ($serverParts.Length -gt 1) {
+                            $hostPart = $serverParts[1]
+                            $domainPart = $hostPart.Split('.', 2)
+                            if ($domainPart.Length -gt 1) {
+                                $kdcCalled = $domainPart[1].ToUpper()
+                            }
+                        }
+                    }
+
+                    $startTime = if ($ticketExt.StartTime) { 
+                        [DateTime]::FromFileTime($ticketExt.StartTime).ToLocalTime() 
+                    } else { 
+                        $null 
+                    }
+                    
+                    $endTime = if ($ticketExt.EndTime) { 
+                        [DateTime]::FromFileTime($ticketExt.EndTime).ToLocalTime() 
+                    } else { 
+                        $null 
+                    }
+                    
+                    $renewTime = if ($ticketExt.RenewUntil) { 
+                        [DateTime]::FromFileTime($ticketExt.RenewUntil).ToLocalTime() 
+                    } else { 
+                        $null 
+                    }
+                    
+                    $keyExpTime = if ($ticketExt.KeyExpirationTime) { 
+                        [DateTime]::FromFileTime($ticketExt.KeyExpirationTime).ToLocalTime() 
+                    } else { 
+                        $null 
+                    }
+
+                    $ticketFlags = "0x{0:X8} -> {1}" -f $ticketExt.TicketFlags, (Get-TicketFlags $ticketExt.TicketFlags)
+                    $cacheFlags = "{0} -> {1}" -f $ticketExt.Flags, (Get-CacheFlags $ticketExt.Flags)
+
+                    # Create the object with properties in klist-like order for default display
+                    $ticketObj = [PSCustomObject]@{
+                        PSTypeName = 'KerberosTicket'
+                        Client = if ($clientName -and $domainName) { 
+                            "$clientName @ $domainName" 
+                        } else { 
+                            $clientName 
+                        }
+                        Server = if ($serviceName -and $domainName) { 
+                            "$serviceName @ $domainName" 
+                        } else { 
+                            $serviceName 
+                        }
+                        KerbTicket_Encryption_Type = if ($encryptionMap[$info.EncryptionType]) { 
+                            $encryptionMap[$info.EncryptionType] 
+                        } else { 
+                            "Unknown ($($info.EncryptionType))" 
+                        }
+                        Ticket_Flags = $ticketFlags
+                        Start_Time = if ($startTime) { 
+                            $startTime.ToString("M/d/yyyy H:mm:ss") + " (local)" 
+                        } else { 
+                            "" 
+                        }
+                        End_Time = if ($endTime) { 
+                            $endTime.ToString("M/d/yyyy H:mm:ss") + " (local)" 
+                        } else { 
+                            "" 
+                        }
+                        Renew_Time = if ($renewTime) { 
+                            $renewTime.ToString("M/d/yyyy H:mm:ss") + " (local)" 
+                        } else { 
+                            "" 
+                        }
+                        Session_Key_Type = $sessionKeyType
+                        Cache_Flags = $cacheFlags
+                        Kdc_Called = $kdcCalled
+                        # Additional properties available with Select-Object *
+                        TimeSkew = $ticketExt.TimeSkew
+                        EncodedTicketSize = $ticketExt.EncodedTicketSize
+                        KeyExpirationTime = if ($keyExpTime) { 
+                            $keyExpTime.ToString("M/d/yyyy H:mm:ss") + " (local)" 
+                        } else { 
+                            "" 
+                        }
+                        DomainName = $domainName
+                        TargetDomainName = $targetDomainName
+                        AltTargetDomainName = $altTargetDomainName
+                        RealmName = $realmName
+                        RawTicketFlags = $ticketExt.TicketFlags
+                        RawCacheFlags = $ticketExt.Flags
+                    }
+                    
+                    # Add default display properties
+                    $ticketObj.PSObject.TypeNames.Insert(0, 'KerberosTicket')
+                    $ticketObj
+                } else {
+                    Write-Verbose "Failed to retrieve detailed ticket for $serverName - Status: 0x$($status.ToString('X8')), ProtStatus: 0x$($ticketProtStatus.ToString('X8'))"
+                    
+                    # Enhanced fallback - try to get realm info from the basic cache info
+                    $realmName = if ($info.RealmName.Buffer -ne [IntPtr]::Zero -and $info.RealmName.Length) { 
+                        [System.Runtime.InteropServices.Marshal]::PtrToStringUni($info.RealmName.Buffer, $info.RealmName.Length/2) 
+                    } else { 
+                        "" 
+                    }
+                    
+                    # Try to parse client from current user context if available
+                    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+                    $clientDisplay = if ($currentUser -and $realmName) {
+                        $username = $currentUser.Split('\')[-1]  # Get username part
+                        "$username @ $realmName"
+                    } else { 
+                        "" 
+                    }
+                    
+                    # Try to extract KDC from server name for fallback
+                    $kdcFallback = ""
+                    if ($serverName) {
+                        $serverParts = $serverName.Split('/')
+                        if ($serverParts.Length -gt 1) {
+                            $hostPart = $serverParts[1]
+                            $domainPart = $hostPart.Split('.', 2)
+                            if ($domainPart.Length -gt 1) {
+                                $kdcFallback = $domainPart[1].ToUpper()
+                            }
+                        }
+                    }
+                    if (!$kdcFallback -and $realmName) {
+                        $kdcFallback = $realmName
+                    }
+                    
+                    $fallbackObj = [PSCustomObject]@{
+                        PSTypeName = 'KerberosTicket'
+                        Client = $clientDisplay
+                        Server = if ($serverName -and $realmName) { 
+                            "$serverName @ $realmName" 
+                        } else { 
+                            $serverName 
+                        }
+                        KerbTicket_Encryption_Type = if ($encryptionMap[$info.EncryptionType]) { 
+                            $encryptionMap[$info.EncryptionType] 
+                        } else { 
+                            "Unknown ($($info.EncryptionType))" 
+                        }
+                        Ticket_Flags = "0x{0:X8} -> {1}" -f $info.TicketFlags, (Get-TicketFlags $info.TicketFlags)
+                        Start_Time = if ($info.StartTime) { 
+                            [DateTime]::FromFileTime($info.StartTime).ToLocalTime().ToString("M/d/yyyy H:mm:ss") + " (local)" 
+                        } else { 
+                            "" 
+                        }
+                        End_Time = if ($info.EndTime) { 
+                            [DateTime]::FromFileTime($info.EndTime).ToLocalTime().ToString("M/d/yyyy H:mm:ss") + " (local)" 
+                        } else { 
+                            "" 
+                        }
+                        Renew_Time = if ($info.RenewTime) { 
+                            [DateTime]::FromFileTime($info.RenewTime).ToLocalTime().ToString("M/d/yyyy H:mm:ss") + " (local)" 
+                        } else { 
+                            "" 
+                        }
+                        Session_Key_Type = if ($encryptionMap[$info.EncryptionType]) { 
+                            $encryptionMap[$info.EncryptionType] 
+                        } else { 
+                            "Unknown ($($info.EncryptionType))" 
+                        }
+                        Cache_Flags = "0"
+                        Kdc_Called = $kdcFallback
+                        # Limited additional properties for fallback
+                        TimeSkew = 0
+                        EncodedTicketSize = 0
+                        KeyExpirationTime = ""
+                        DomainName = ""
+                        TargetDomainName = ""
+                        AltTargetDomainName = ""
+                        RealmName = $realmName
+                        RawTicketFlags = $info.TicketFlags
+                        RawCacheFlags = 0
+                    }
+                    
+                    $fallbackObj.PSObject.TypeNames.Insert(0, 'KerberosTicket')
+                    $fallbackObj
+                }
+            }
+            catch {
+                Write-Warning "Error retrieving full ticket for $($serverName): $_"
+            }
+            finally {
+                if ($ticketReqPtr -ne [IntPtr]::Zero) { 
+                    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($ticketReqPtr) 
+                }
+                if ($ticketReturnBuffer -ne [IntPtr]::Zero) { 
+                    [Secur32]::LsaFreeReturnBuffer($ticketReturnBuffer) | Out-Null 
+                }
+                if ($ticketTargetNameBuf -ne [IntPtr]::Zero) { 
+                    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($ticketTargetNameBuf) 
+                }
+            }
+        }
+        
+        return $tickets
+    }
+    catch { 
+        Write-Error "Get-KerberosTicket failed: $_"
+        return @() 
+    }
+    finally {
+        if ($tokenHandle) { 
+            [Secur32]::CloseHandle($tokenHandle) | Out-Null 
+        }
+        if ($pReq) { 
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pReq) 
+        }
+        if ($returnBuffer) { 
+            [Secur32]::LsaFreeReturnBuffer($returnBuffer) | Out-Null 
+        }
+        if ($kerbNameBuf) { 
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($kerbNameBuf) 
+        }
+        if ($lsaHandle) { 
+            [Secur32]::LsaDeregisterLogonProcess($lsaHandle) | Out-Null 
+        }
+    }
+}
+
+#-----------------------------------------------------------------------
+# Helper Functions for Test-TgsAndSpnValidation
+#-----------------------------------------------------------------------
+function Get-KerberosErrorAnalysis {
+    <#
+    .SYNOPSIS
+        Provides detailed analysis of Win32 error codes in the context of Kerberos PAC validation.
+    #>
+    param(
+        [int]$ErrorCode,
+        [string]$TestPath
+    )
+
+    $analysis = @{
+        Category = 'Unknown'
+        Diagnostics = ''
+    }
+
+    switch ($ErrorCode) {
+        # Access Denied - Strong PAC validation failure indicator
+        5 {
+            $analysis.Category = 'PAC_Validation_Likely'
+            $analysis.Diagnostics = @"
+STRONG INDICATOR: This is likely a PAC validation failure. The authentication succeeded (server recognized the user), but authorization failed.
+
+Possible causes:
+• PAC validation failed due to trust relationship issues
+• User's group memberships in the PAC don't match what the server expects
+• Time synchronization issues affecting PAC validation
+• Corrupted or tampered PAC data
+• Cross-domain trust configuration problems
+
+Recommended actions:
+• Check domain trust relationships
+• Verify time synchronization between client, DC, and target server
+• Review security event logs on the target server (Events 4625, 4768, 4769)
+• Test with a different user account
+• Check if the issue persists after 'klist purge' and re-authentication
+"@
+        }
+        
+        # Network path not found
+        53 {
+            $analysis.Category = 'Network_Connectivity'
+            $analysis.Diagnostics = @"
+NETWORK ISSUE: The network path cannot be found. This is typically not a PAC validation issue.
+
+Possible causes:
+• Target server is unreachable (network/firewall)
+• Server service not running on target
+• DNS resolution failure
+• NetBIOS name resolution issues
+
+This error occurs before Kerberos authentication, so PAC validation is not being tested.
+"@
+        }
+        
+        # The network name cannot be found
+        67 {
+            $analysis.Category = 'Name_Resolution'
+            $analysis.Diagnostics = @"
+NAME RESOLUTION: Cannot resolve the network name. This prevents Kerberos authentication from occurring.
+
+Possible causes:
+• DNS resolution failure for the target server
+• NetBIOS name resolution issues
+• Incorrect server name in the path
+
+This error occurs before Kerberos authentication, so PAC validation cannot be tested.
+"@
+        }
+        
+        # Multiple connections with different credentials
+        1219 {
+            $analysis.Category = 'Credential_Conflict'
+            $analysis.Diagnostics = @"
+CREDENTIAL CONFLICT: Multiple connections to the same server with different credentials.
+
+This is not a PAC validation issue. Disconnect existing connections:
+• net use /delete \\servername
+• net use * /delete (to clear all)
+
+Then retry the test.
+"@
+        }
+        
+        # No logon servers available
+        1311 {
+            $analysis.Category = 'Domain_Controller_Unavailable'
+            $analysis.Diagnostics = @"
+DC UNAVAILABLE: No domain controllers are available to process the authentication request.
+
+This prevents Kerberos authentication from occurring, so PAC validation cannot be tested.
+
+Possible causes:
+• All domain controllers are down or unreachable
+• Network connectivity issues to domain controllers
+• DNS issues preventing DC location
+"@
+        }
+        
+        # Logon failure: target account name incorrect (SPN issues)
+        1396 {
+            $analysis.Category = 'SPN_Issue'
+            $analysis.Diagnostics = @"
+SPN ISSUE: The target account name is incorrect. This is typically a Service Principal Name (SPN) problem.
+
+This prevents proper Kerberos authentication, so PAC validation cannot be tested.
+
+Common causes:
+• Missing or incorrect SPN registration for the service
+• Duplicate SPNs registered to multiple accounts
+• SPN format issues
+
+Check SPNs with: setspn -L [target-server-name]
+"@
+        }
+        
+        # Logon failure
+        1326 {
+            $analysis.Category = 'Authentication_Failure'
+            $analysis.Diagnostics = @"
+AUTHENTICATION FAILURE: Logon failure occurred during Kerberos authentication.
+
+This could be related to PAC validation, but could also be other authentication issues.
+
+Possible causes:
+• User account locked, disabled, or expired
+• Password expired or incorrect
+• Authentication policy restrictions
+• PAC validation failure
+• Trust relationship issues
+
+Check security event logs for more specific error details.
+"@
+        }
+        
+        default {
+            $analysis.Category = 'Other'
+            $analysis.Diagnostics = @"
+An error occurred that is not commonly associated with PAC validation issues.
+
+For comprehensive troubleshooting:
+• Check the target server's event logs
+• Review Kerberos-specific events (4768, 4769, 4771)
+• Verify network connectivity and name resolution
+• Ensure the Server service is running on the target
+
+Error code $ErrorCode may require additional research for specific diagnosis.
+"@
+        }
+    }
+
+    return $analysis
+}
+#endregion Private Helpers
+
+
+#-----------------------------------------------------------------------
+# SECTION 2: Public Functions
+# These are the functions intended for the end-user to call.
+#-----------------------------------------------------------------------
+function Test-DnsResolution {
+    <#
+    .SYNOPSIS
+        Resolves DNS for a domain controller and returns IPv4 addresses.
+    .DESCRIPTION
+        Performs a DNS lookup on the specified domain controller using System.Net.Dns.
+    .PARAMETER DomainController
+        The FQDN or hostname of the domain controller to resolve.
+    .INPUTS
+        System.String. You can pipe a domain controller FQDN to this function.
+    .OUTPUTS
+        System.Collections.Hashtable
+    .EXAMPLE
+        Test-DnsResolution -DomainController "dc01.contoso.com"
+    .LINK
+        https://docs.microsoft.com/en-us/dotnet/api/system.net.dns
+    .NOTES
+        Only returns IPv4 addresses.
+    #>
+	param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController
+    )
+
+    Write-Verbose "Resolving DNS for $DomainController"
+
+	$result = @{
+		success = $false
+		resolvedIPs = @()
+		errorMessage = $null
+	}
+
+	try {
+		$ipv4Addresses = [System.Net.Dns]::GetHostAddresses($DomainController) |
+            Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+            ForEach-Object { $_.IPAddressToString }
+
+		if ($ipv4Addresses.Count -eq 0) {
+			$result.ErrorMessage = "No IPv4 addresses found for $DomainController"
+		} else {
+			$result.Success = $true
+			$result.ResolvedIPs = $ipv4Addresses
+		}
+	} catch [System.Net.Sockets.SocketException] {
+        $result.ErrorMessage = "DNS resolution failed: $($_.Exception.Message)"
+    } catch {
+		$result.ErrorMessage = "An unexpected error occurred during DNS resolution: $($_.Exception.Message)"
+	}
+
+	return $result
+}
+
+function Test-TcpConnectivity {
+    <#
+    .SYNOPSIS
+        Tests TCP connectivity to specific ports on a domain controller with a configurable timeout.
+    .DESCRIPTION
+        Attempts to open a TCP connection to specified ports using the .NET TcpClient class.
+        This allows for a precise connection timeout and includes retry logic.
+    .PARAMETER DomainController
+        The FQDN or hostname of the domain controller to test.
+    .PARAMETER TimeoutSeconds
+        The maximum number of seconds to wait for a single TCP connection attempt to succeed.
+    .PARAMETER RetryDelaySeconds
+        The number of seconds to wait between retry attempts.
+    .PARAMETER RetryCount
+        The number of retry attempts for each port.
+    .PARAMETER Ports
+        An array of port numbers to test.
+    .INPUTS
+        System.String
+    .OUTPUTS
+        System.Collections.Hashtable
+    .EXAMPLE
+        Test-TcpConnectivity -DomainController "dc01.contoso.com" -TimeoutSeconds 3 -RetryCount 2
+    .LINK
+        System.Net.Sockets.TcpClient
+    .NOTES
+        This function uses the .NET TcpClient for precise timeout control and does not
+        depend on Test-NetConnection or ICMP (ping).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController,
+
+        [Parameter()]
+        [ValidateRange(1, 60)]
+        [int]$TimeoutSeconds = 5,
+
+        [Parameter()]
+        [ValidateRange(0, 30)]
+        [int]$RetryDelaySeconds = 3,
+
+        [Parameter()]
+        [ValidateRange(1, 5)]
+        [int]$RetryCount = 3,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [int[]]$Ports = @(88, 389, 636)
+    )
+
+    Write-Verbose "Testing TCP connectivity to $DomainController on ports: $($Ports -join ', ')"
+
+    $result = @{}
+    foreach ($port in $Ports) {
+        $label = "TcpPort$port"
+        $success = $false
+        $message = ""
+        $connectionTimeMs = $null
+        $remoteAddress = $null
+
+        for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+            Write-Verbose "Attempt $attempt of $RetryCount for port $port"
+            $tcpClient = $null
+            $stopwatch = [System.Diagnostics.Stopwatch]::new()
+            
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $stopwatch.Start()
+
+                # Start the asynchronous connection attempt
+                $connectTask = $tcpClient.ConnectAsync($DomainController, $port)
+
+                # Wait for the task to complete, with our specified timeout
+                $isCompletedInTime = $connectTask.Wait($TimeoutSeconds * 1000)
+
+                $stopwatch.Stop()
+                
+                if ($isCompletedInTime -and $tcpClient.Connected) {
+                    $success = $true
+                    $message = "Open (TCP connection successful on attempt $attempt)"
+                    $connectionTimeMs = $stopwatch.ElapsedMilliseconds
+                    # Get the IP we actually connected to from the endpoint
+                    $remoteAddress = ($tcpClient.Client.RemoteEndPoint).Address.ToString()
+                    break # Exit the retry loop on success
+                } else {
+                    # This case handles the timeout
+                    $tcpClient.Close() # Close the client on timeout to clean up the socket
+                    $message = "Attempt $attempt failed: Connection to port $port timed out after $TimeoutSeconds seconds."
+                }
+            } catch {
+                $stopwatch.Stop()
+                $message = "Attempt $attempt failed with an exception: $($_.Exception.Message)"
+            } finally {
+                # Ensure the client is always disposed of properly
+                if ($null -ne $tcpClient) {
+                    $tcpClient.Dispose()
+                }
+            }
+            
+            if ($attempt -lt $RetryCount) {
+                Start-Sleep -Seconds $RetryDelaySeconds
+            }
+        }
+
+        $result[$label] = @{
+            Success          = $success
+            Message          = $message
+            ConnectionTimeMs = $connectionTimeMs
+            RemoteAddress    = $remoteAddress
+        }
+    }
+
+    return $result
+}
+
+function Invoke-KerberosAsRequest {
+	<#
+	.SYNOPSIS
+		Invokes a Kerberos AS-REQ to test KDC reachability and basic functionality.
+
+	.DESCRIPTION
+        Builds a minimal ASN.1-encoded KERBEROS_AS_REQ packet and sends it over UDP to the specified KDC.
+        It then uses a robust, recursive ASN.1 parser to analyze the response (AS-REP or KRB-ERROR)
+        to reliably determine if the KDC is functioning correctly. A KRB-ERROR response with
+        "Pre-authentication required" (error 25) is considered a success for this test's purpose.
+
+	.PARAMETER Server
+		FQDN or host name of the target KDC.
+
+	.PARAMETER Port
+		UDP port for Kerberos (default 88).
+
+	.PARAMETER Realm
+		Kerberos realm (e.g., CONTOSO.COM). If omitted, derived from the Server name.
+
+	.PARAMETER ClientName
+		Client principal name to use in the request. Defaults to the current user.
+
+	.PARAMETER TimeoutMs
+		Max milliseconds to wait for a UDP response (default 5000).
+
+	.PARAMETER TillTime
+		Ticket lifetime end time (defaults to 8 hours from now).
+
+	.PARAMETER Nonce
+		Request nonce (defaults to random value for better security).
+
+	.NOTES
+        This function combines ASN.1 encoder logic with a robust, recursive
+        ASN.1 parser to reliably interpret the KDC's response.
+
+	.EXAMPLE
+		Invoke-KerberosAsRequest -Server dc01.contoso.com -Verbose
+
+    .INPUTS
+        System.String
+    .OUTPUTS
+        PSCustomObject
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory, Position = 0)]
+		[ValidateNotNullOrEmpty()]
+		[string]$Server,
+
+		[ValidateRange(1, 65535)]
+		[int]$Port = 88,
+
+		[ValidateNotNullOrEmpty()]
+		[string]$Realm = $null,
+
+		[Parameter()]
+		[string]$ClientName = $null,
+
+		[ValidateRange(100, 60000)]
+		[int]$TimeoutMs = 5000,
+
+		[DateTime]$TillTime = [DateTime]::Now.AddHours(8),
+
+		[int]$Nonce = (Get-Random -Minimum 100000000 -Maximum 999999999)
+	)
+
+	begin {
+		if ([string]::IsNullOrEmpty($ClientName)) {
+			$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+			if ($currentUser -match '\\') {
+				$ClientName = $currentUser.Split('\')[1]
+			}
+			else {
+				$ClientName = $currentUser
+			}
+			Write-Verbose "ClientName not specified; using current user: $ClientName"
+		}
+	}
+
+	process {
+		try {
+			# Derive realm from server name if not provided
+			if ([string]::IsNullOrWhiteSpace($Realm)) {
+				$labels = $Server.Split('.')
+				switch ($labels.Count) {
+					{ $_ -ge 3 } {
+						$Realm = ($labels[1..($labels.Count - 1)] -join '.').ToUpper()
+						break
+					}
+					2 {
+						$Realm = ($labels -join '.').ToUpper()
+						break
+					}
+					default {
+						throw "Cannot derive realm from server name '$Server'. Please specify the -Realm parameter."
+					}
+				}
+				Write-Verbose "Derived realm from server name: $Realm"
+			}
+
+			Write-Verbose "Testing Kerberos connectivity to $Server`:$Port (Realm: $Realm)"
+			Write-Verbose "Client: $ClientName, Nonce: $Nonce, TillTime: $($TillTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+			
+			Write-Verbose "[1/5] Building AS-REQ packet..."
+			$asReqPacket = New-KerberosAsReqPacket -ClientName $ClientName -Realm $Realm -TillTime $TillTime
+			Write-Verbose "  AS-REQ packet size: $($asReqPacket.Length) bytes"
+
+			Write-Verbose "[2/5] Resolving hostname..."
+			$ServerIP = $null
+			try {
+				$dnsRecords = [System.Net.Dns]::GetHostAddresses($Server)
+				$ServerIP = $dnsRecords | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+				if (-not $ServerIP) {
+					throw "No IPv4 address found for '$Server'"
+				}
+				Write-Verbose "  Resolved to: $($ServerIP.IPAddressToString)"
+			}
+			catch {
+				throw "DNS resolution failed for '$Server': $($_.Exception.Message)"
+			}
+
+			Write-Verbose "[3/5] Sending AS-REQ packet..."
+			$udpClient = $null
+			$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+			try {
+				$udpClient = New-Object System.Net.Sockets.UdpClient
+				$udpClient.Client.ReceiveTimeout = $TimeoutMs
+				$udpClient.Client.SendTimeout = $TimeoutMs
+				$remoteEP = [System.Net.IPEndPoint]::new($ServerIP, $Port)
+				
+				$bytesSent = $udpClient.Send($asReqPacket, $asReqPacket.Length, $remoteEP)
+				Write-Verbose "  Sent $bytesSent bytes"
+
+				Write-Verbose "[4/5] Waiting for response (timeout: ${TimeoutMs}ms)..."
+				$receivedEP = $remoteEP
+				$response = $udpClient.Receive([ref]$receivedEP)
+				$stopwatch.Stop()
+				Write-Verbose "  Received $($response.Length) bytes in $($stopwatch.ElapsedMilliseconds)ms"
+
+				Write-Verbose "[5/5] Analyzing response..."
+				$analysis = Get-KerberosResponseAnalysis -ResponseBytes $response
+				
+				# Enhanced success determination
+				$isOperational = $analysis.IsSuccess -or 
+								($analysis.Type -eq 'KRB-ERROR' -and $analysis.ErrorCode -in @(6, 25)) # Client unknown or preauth required
+				
+				if ($analysis.Type -eq 'KRB-ERROR' -and $analysis.ErrorCode -eq 6) {
+					Write-Verbose "  KDC is operational (client principal unknown - expected for test)"
+				}
+				elseif ($analysis.IsSuccess) {
+					Write-Verbose "  KDC response indicates success: $($analysis.ErrorDescription)"
+				}
+				else {
+					Write-Verbose "  KDC error: $($analysis.ErrorDescription)"
+				}
+
+				$result = [PSCustomObject]@{
+					PSTypeName = 'KerberosAsRequestResult'
+					Success = $isOperational
+					Operational = $isOperational
+					Server = $Server
+					ServerIP = $ServerIP.IPAddressToString
+					Port = $Port
+					Realm = $Realm
+					ClientName = $ClientName
+					ResponseTime = $stopwatch.ElapsedMilliseconds
+					ResponseSize = $response.Length
+					ResponseType = $analysis.Type
+					ErrorCode = $analysis.ErrorCode
+					ErrorDescription = $analysis.ErrorDescription
+					Timestamp = [DateTime]::Now
+				}
+				
+				return $result
+			}
+			catch [System.Net.Sockets.SocketException] {
+				$stopwatch.Stop()
+				$errorMsg = switch ($_.Exception.SocketErrorCode) {
+					'TimedOut' { "Connection timed out after ${TimeoutMs}ms - KDC may be unreachable or not responding" }
+					'ConnectionRefused' { "Connection refused - KDC service may not be running on port $Port" }
+					'HostUnreachable' { "Host unreachable - network connectivity issue" }
+					'NetworkUnreachable' { "Network unreachable - routing issue" }
+					default { "Socket error: $($_.Exception.SocketErrorCode) - $($_.Exception.Message)" }
+				}
+				throw $errorMsg
+			}
+			finally {
+				if ($udpClient) {
+					$udpClient.Close()
+					$udpClient.Dispose()
+				}
+			}
+		}
+		catch {
+			return [PSCustomObject]@{
+				PSTypeName = 'KerberosAsRequestResult'
+				Success = $false
+				Operational = $false
+				Server = $Server
+				ServerIP = if ($ServerIP) { $ServerIP.IPAddressToString } else { $null }
+				Port = $Port
+				Realm = $Realm
+				ClientName = $ClientName
+				ResponseTime = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
+				ResponseSize = 0
+				ResponseType = 'ERROR'
+				ErrorCode = $null
+				ErrorDescription = $_.Exception.Message
+				Timestamp = [DateTime]::Now
+			}
+		}
+	}
+}
+
+function Test-TimeSynchronization {
+    <#
+    .SYNOPSIS
+        Checks time synchronization against a domain controller using w32tm.exe.
+    .DESCRIPTION
+        Executes the w32tm.exe utility to determine the time offset between the local machine
+        and the specified domain controller. It then evaluates if the skew is within the
+        acceptable range for Kerberos authentication (typically 5 minutes).
+    .PARAMETER DomainController
+        The domain controller to check against.
+    .INPUTS
+        System.String
+    .OUTPUTS
+        PSCustomObject
+    .EXAMPLE
+        Test-TimeSynchronization -DomainController "dc01.contoso.com"
+    .LINK
+        w32tm
+    .NOTES
+        This function is a robust wrapper for w32tm.exe. It checks the command's exit code
+        and handles parsing errors gracefully. A non-zero time skew is expected in normal
+        operation; the key result is whether the skew is within the allowed maximum.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController
+    )
+
+    Write-Verbose "Checking time synchronization with $DomainController using w32tm.exe"
+
+    $result = [PSCustomObject]@{
+        Success          = $false
+        TimeSkewSeconds  = $null
+        IsSkewAcceptable = $false
+        MaxAllowedSkew   = 300 # 5 minutes is the default maximum for Kerberos
+        ErrorMessage     = ''
+    }
+
+    try {
+        # Execute w32tm, merging the error stream (2) into the success stream (1)
+        # so we can capture all output from the command.
+        $w32tmOutput = w32tm.exe /stripchart /computer:$DomainController /samples:1 /dataonly 2>&1
+
+        # A non-zero exit code is the most reliable sign of command failure.
+        if ($LASTEXITCODE -ne 0) {
+            $result.ErrorMessage = "w32tm.exe failed with exit code $LASTEXITCODE. Error: $($w32tmOutput -join ' ')"
+            # Exit here; no point in trying to parse the output if the command failed.
+            return $result
+        }
+
+        # If the command succeeded, now we can safely attempt to parse its output.
+        # This regex looks for a line ending with a comma, optional space, and the time offset.
+        $offsetLine = $w32tmOutput | Select-String -Pattern ',\s*([+\-][0-9\.]+s)$'
+
+        if ($offsetLine) {
+            # The capture group ([1]) contains the offset string like "+0.00123s"
+            # We remove the "s" and convert it to a double.
+            $timeSkewString = $offsetLine.Matches[0].Groups[1].Value.Replace('s', '')
+            $timeSkew = [Math]::Abs([double]$timeSkewString)
+
+            $result.Success = $true
+            $result.TimeSkewSeconds = $timeSkew
+            $result.IsSkewAcceptable = ($timeSkew -le $result.MaxAllowedSkew)
+
+            if (-not $result.IsSkewAcceptable) {
+                $result.ErrorMessage = "Time skew of $timeSkew seconds exceeds the Kerberos maximum of $($result.MaxAllowedSkew) seconds."
+            }
+        }
+        else {
+            # The command ran, but the output didn't contain the data we expected.
+            $result.ErrorMessage = "Could not parse time offset from w32tm output. Output was: $($w32tmOutput -join ' ')"
+        }
+    }
+    catch {
+        $result.ErrorMessage = "An exception occurred while running w32tm.exe: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Test-AlternativeAuthentication {
+    <#
+    .SYNOPSIS
+        Tests non-Kerberos authentication methods (NTLM, Basic, Anonymous) against an LDAP server.
+    .DESCRIPTION
+        Validates non-Kerberos LDAP authentication methods for diagnostic purposes. It reports not only
+        on success or failure, but also on the security implications of the configuration.
+    .PARAMETER DomainController
+        The domain controller to test.
+    .PARAMETER Credential
+        Optional credentials for testing authenticated methods like NTLM and Basic.
+    .PARAMETER TimeoutSeconds
+        Timeout for LDAP connection attempts.
+    .INPUTS
+        System.Management.Automation.PSCredential
+    .OUTPUTS
+        PSCustomObject
+    .EXAMPLE
+        Test-AlternativeAuthentication -DomainController "dc01.contoso.com"
+    .LINK
+        System.DirectoryServices.Protocols.LdapConnection
+    .NOTES
+        This function is used for diagnostic purposes when Kerberos authentication fails, or to audit
+        which legacy authentication protocols are enabled on a domain controller.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [ValidateRange(1, 60)]
+        [int]$TimeoutSeconds = 15
+    )
+
+    # This private helper function eliminates repetitive try/catch blocks.
+    function Invoke-LdapBind {
+        param(
+            [Parameter(Mandatory)]
+            [System.DirectoryServices.Protocols.LdapConnection]$Connection
+        )
+        $bindResult = @{ Success = $false; ErrorMessage = $null }
+        try {
+            $Connection.Bind()
+            $bindResult.Success = $true
+        }
+        catch {
+            $bindResult.ErrorMessage = $_.Exception.Message
+        }
+        finally {
+            if ($Connection) {
+                $Connection.Dispose()
+            }
+        }
+        return $bindResult
+    }
+
+    Write-Verbose "Testing alternative authentication methods against $DomainController"
+
+    $result = [PSCustomObject]@{
+        DomainController      = $DomainController
+        Timestamp             = Get-Date
+        AnonymousBindResult   = 'NotTested'
+        AnonymousBindError    = ''
+        NtlmBindResult        = 'NotTested'
+        NtlmBindError         = ''
+        BasicBindResult       = 'NotTested'
+        BasicBindError        = ''
+    }
+
+    # Test Anonymous Authentication
+    Write-Verbose "Testing anonymous LDAP bind..."
+    $anonymousConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
+    $anonymousConn.SessionOptions.ProtocolVersion = 3
+    $anonymousConn.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+    $anonymousConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
+    
+    $anonymousResult = Invoke-LdapBind -Connection $anonymousConn
+    # A successful anonymous bind is a security risk. A failure is the expected, secure state.
+    $result.AnonymousBindResult = if ($anonymousResult.Success) { 'Enabled (Insecure)' } else { 'Disabled (Secure)' }
+    $result.AnonymousBindError = $anonymousResult.ErrorMessage
+
+
+    # Test NTLM Authentication
+    Write-Verbose "Testing NTLM authentication..."
+    $ntlmConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
+    $ntlmConn.SessionOptions.ProtocolVersion = 3
+    $ntlmConn.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+    $ntlmConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Ntlm
+    if ($Credential) {
+        $ntlmConn.Credential = $Credential.GetNetworkCredential()
+    }
+    
+    $ntlmResult = Invoke-LdapBind -Connection $ntlmConn
+    $result.NtlmBindResult = if ($ntlmResult.Success) { 'Success' } else { 'Failure' }
+    $result.NtlmBindError = $ntlmResult.ErrorMessage
+
+
+    # Test Basic Authentication (only if credentials provided)
+    if ($Credential) {
+        Write-Verbose "Testing Basic authentication..."
+        $basicConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
+        $basicConn.SessionOptions.ProtocolVersion = 3
+        $basicConn.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+        $basicConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Basic
+        $basicConn.Credential = $Credential.GetNetworkCredential()
+        
+        $basicResult = Invoke-LdapBind -Connection $basicConn
+        # A successful Basic bind is a security risk. A failure is the expected, secure state.
+        $result.BasicBindResult = if ($basicResult.Success) { 'Enabled (Insecure)' } else { 'Disabled (Secure)' }
+        $result.BasicBindError = $basicResult.ErrorMessage
+    }
+    else {
+        $result.BasicBindResult = 'Skipped'
+        $result.BasicBindError = 'No credentials provided'
+    }
+
+    return $result
+}
+
+function Test-KerberosSession {
+    <#
+    .SYNOPSIS
+        Checks the current user's session to verify it was authenticated using a Kerberos-capable provider.
+    .DESCRIPTION
+        Uses the .NET [System.Security.Principal.WindowsIdentity] class to inspect the
+        current PowerShell session's security context. It considers both 'Kerberos' and 'Negotiate'
+        as successful authentication types for a domain environment.
+    .OUTPUTS
+        PSCustomObject with details about the current session's identity.
+    .EXAMPLE
+        Test-KerberosSession
+    .NOTES
+        A result of 'Negotiate' indicates the session will attempt to use Kerberos first before
+        falling back to NTLM, and is considered a success for this test.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $result = [PSCustomObject]@{
+        Success            = $false
+        UserName           = 'Unknown'
+        AuthenticationType = 'Unknown'
+        ImpersonationLevel = 'Unknown'
+        Message            = ''
+    }
+
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        
+        $result.UserName = $identity.Name
+        $result.AuthenticationType = $identity.AuthenticationType
+        $result.ImpersonationLevel = $identity.ImpersonationLevel
+
+        if ($result.AuthenticationType -in 'Kerberos', 'Negotiate') {
+            $result.Success = $true
+            $result.Message = "Session authentication provider is '$($result.AuthenticationType)', which supports Kerberos."
+        }
+        else {
+            $result.Message = "The current session is authenticated via '$($result.AuthenticationType)', which does not use Kerberos. Domain authentication will likely fail or use NTLM."
+        }
+    }
+    catch {
+        $result.Message = "An error occurred while getting the current Windows identity: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Test-TgtRequest {
+    <#
+     <#
+    .SYNOPSIS
+        Provides a detailed diagnostic test of Kerberos LDAP bind configurations.
+    .DESCRIPTION
+        Performs a comprehensive test of Kerberos authentication by attempting an LDAP bind for each
+        possible security configuration. It includes highly specific exception handling and secondary
+        diagnostic checks (like for SPNs) to precisely diagnose the root cause of failures.
+    .PARAMETER DomainController
+        The domain controller to test.
+    .PARAMETER Credential
+        Optional alternate credentials for testing.
+    .PARAMETER TimeoutSeconds
+        Timeout for each individual LDAP bind operation.
+    .INPUTS
+        System.Management.Automation.PSCredential
+    .OUTPUTS
+        A stream of PSCustomObjects with detailed results for each configuration tested.
+    .EXAMPLE
+        Test-TgtRequest -DomainController "dc01.contoso.com" | Where-Object { -not $_.Success }
+    .NOTES
+        This function is designed for high-fidelity root cause analysis.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'CurrentUser')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController,
+
+        [Parameter(ParameterSetName = 'AlternateCredential', Mandatory = $true)]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [ValidateRange(1, 120)]
+        [int]$TimeoutSeconds = 30
+    )
+
+    begin {
+        try {
+            Add-Type -AssemblyName System.DirectoryServices.Protocols -ErrorAction Stop
+        }
+        catch {
+            throw "Failed to load required assembly 'System.DirectoryServices.Protocols'."
+        }
+    }
+
+    process {
+        $authType = if ($PSCmdlet.ParameterSetName -eq 'AlternateCredential') {
+            "AlternateCredential ($($Credential.UserName))"
+        }
+        else {
+            "CurrentUser ($([System.Security.Principal.WindowsIdentity]::GetCurrent().Name))"
+        }
+        $timestamp = Get-Date
+
+        $securityConfigurations = @(
+            [pscustomobject]@{ Signing = $true; Sealing = $true; Description = "Signing and Sealing" },
+            [pscustomobject]@{ Signing = $true; Sealing = $false; Description = "Signing Only" },
+            [pscustomobject]@{ Signing = $false; Sealing = $false; Description = "No Signing or Sealing" }
+        )
+
+        foreach ($config in $securityConfigurations) {
+            $ldapConn = $null
+            $isSuccess = $false
+            $errorMessage = $null
+            $errorCategory = 'None'
+            
+            Write-Verbose "Attempting Kerberos bind with configuration: $($config.Description)"
+            
+            try {
+                # ... (LDAP connection setup is the same as before)
+                $ldapConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
+                $ldapConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Kerberos
+                $ldapConn.SessionOptions.ProtocolVersion = 3
+                $ldapConn.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+                $ldapConn.SessionOptions.Signing = $config.Signing
+                $ldapConn.SessionOptions.Sealing = $config.Sealing
+                if ($PSCmdlet.ParameterSetName -eq 'AlternateCredential') {
+                    $ldapConn.Credential = $Credential.GetNetworkCredential()
+                }
+
+                $ldapConn.Bind()
+                $isSuccess = $true
+            }
+            catch [System.TimeoutException] {
+                $errorCategory = 'Timeout'
+                $errorMessage = "Operation timed out after $TimeoutSeconds seconds. This suggests a network or firewall issue is blocking the LDAP response from the server."
+            }
+            catch [System.DirectoryServices.Protocols.LdapException] {
+                $errorCategory = 'LdapError'
+                $baseMessage = "LDAP server returned an error: $($_.Exception.Message) (Code: $($_.Exception.ErrorCode))."
+                
+                # If it's an Invalid Credentials error, it could be an SPN issue. Launch a secondary test.
+                if ($_.Exception.ErrorCode -eq 49) {
+                    $expectedSpn = "LDAP/$DomainController"
+                    Write-Verbose "LDAP error 49 detected. Running correlated SPN check for '$expectedSpn'..."
+                    $spnStatus = Test-KerberosSpn -Spn $expectedSpn
+                    $baseMessage += " [DIAGNOSIS: This error code often relates to SPN issues. SPN check result: $spnStatus]"
+                }
+                $errorMessage = $baseMessage
+            }
+            catch [System.Security.Authentication.AuthenticationException] {
+                $errorCategory = 'AuthenticationError'
+                $exMessage = $_.Exception.Message
+                # Parse the generic authentication exception for common Kerberos-related keywords.
+                $diagnosticHint = switch -Regex ($exMessage) {
+                    'The target principal name is incorrect' { "This is a classic SPN or DNS alias issue. The name the client is using does not match the Kerberos ticket." }
+                    'unsupported etype|encryption type' { "This indicates a cipher suite mismatch. The client or server may have certain encryption types (like RC4) disabled by policy." }
+                    default { "This may indicate a client-side Kerberos provider issue, a bad ticket in the local cache, or a problem with the underlying SSPI security context." }
+                }
+                $errorMessage = "A general authentication failure occurred: `"$exMessage`". [DIAGNOSIS: $diagnosticHint]"
+            }
+            catch {
+                $errorCategory = 'UnexpectedError'
+                $errorMessage = "An unexpected exception occurred: $($_.Exception.Message)"
+            }
+            finally {
+                if ($ldapConn) {
+                    $ldapConn.Dispose()
+                }
+            }
+            
+            [PSCustomObject]@{
+                DomainController    = $DomainController
+                AuthenticationType  = $authType
+                Timestamp           = $timestamp
+                Configuration       = $config.Description
+                Success             = $isSuccess
+                ErrorCategory       = $errorCategory
+                ErrorMessage        = $errorMessage
+            }
+        }
+    }
+}
+
+function Test-TgsAndSpnValidation {
+    <#
+    .SYNOPSIS
+        Tests TGS request and validates the SPN ticket in the cache using the LSA API.
+    .DESCRIPTION
+        This function first triggers a service ticket request, then calls the robust Get-KerberosTicket
+        function to query the LSA ticket cache directly. It validates the ticket by searching the
+        structured results, which is far more reliable than parsing klist.exe output.
+    .PARAMETER DomainController
+        The domain controller to test against.
+    .PARAMETER Credential
+        Alternate credentials. If provided, the test is skipped because Get-KerberosTicket can only inspect
+        the ticket cache of the current user's logon session.
+    .PARAMETER PurgeCache
+        If specified, this switch will run 'klist purge' to clear all Kerberos tickets BEFORE
+        running the test. Use with caution.
+    .INPUTS
+        System.Management.Automation.PSCredential
+    .OUTPUTS
+        PSCustomObject
+    .EXAMPLE
+        Test-TgsAndSpnValidation -DomainController "dc01.contoso.com"
+    .NOTES
+        Requires the Microsoft ActiveDirectory PowerShell module to be available for the ticket trigger.
+        WARNING: Using the -PurgeCache switch is a destructive action that will affect the current user session.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$PurgeCache
+    )
+
+    $result = [PSCustomObject]@{
+        Success           = $false
+        SpnChecked        = "ldap/$DomainController" # Note: LSA returns lower-case SPNs
+        TicketRequested   = $false
+        TicketFound       = $false
+        EncryptionType    = 'Not Found'
+        ErrorMessage      = ''
+    }
+
+    if ($PSBoundParameters.ContainsKey('Credential')) {
+        $result.ErrorMessage = 'Test skipped: This function inspects the current logon session ticket cache only.'
+        return $result
+    }
+
+    if ($PurgeCache.IsPresent) {
+        Write-Verbose "Purging Kerberos ticket cache as requested by -PurgeCache switch."
+        try {
+            klist.exe purge | Out-Null
+        } catch { Write-Warning "An error occurred while trying to purge the ticket cache: $($_.Exception.Message)" }
+    }
+
+    # Step 1: Trigger a service ticket request.
+    try {
+        Write-Verbose "Triggering new service ticket request for $($result.SpnChecked)"
+        Get-ADRootDSE -Server $DomainController -ErrorAction Stop | Out-Null
+        $result.TicketRequested = $true
+    }
+    catch {
+        $result.ErrorMessage = "Failed to trigger a service ticket request (Get-ADRootDSE). Error: $($_.Exception.Message)"
+        return $result
+    }
+
+    # Step 2: Query the cache using the robust API wrapper.
+    try {
+        $cachedTickets = Get-KerberosTicket -ErrorAction Stop
+
+        # All parsing is replaced by this simple, reliable Where-Object clause.
+        $theTicket = $cachedTickets | Where-Object { $_.Server -match $result.SpnChecked }
+        
+        if ($theTicket) {
+            $result.Success = $true
+            $result.TicketFound = $true
+            $result.EncryptionType = $theTicket.KerbTicket_Encryption_Type
+            $result.ErrorMessage = "Successfully found service ticket in cache via LSA API."
+        }
+        else {
+            $result.ErrorMessage = "A ticket for '$($result.SpnChecked)' was not found in the cache after a successful request."
+        }
+    }
+    catch {
+        $result.ErrorMessage = "An error occurred while querying the LSA ticket cache: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Test-KerberosPacValidation {
+    <#
+    .SYNOPSIS
+        Performs a direct, low-level functional test of Kerberos PAC validation by accessing a network share via the Win32 API.
+    .DESCRIPTION
+        This function tests the usability of the Privilege Attribute Certificate (PAC) by using P/Invoke to call the native
+        CreateFileW Windows API. This bypasses higher-level PowerShell providers to get faster and more specific error codes.
+        It attempts to open a known directory (like SYSVOL). The function returns detailed diagnostics about the PAC validation.
+    .PARAMETER DomainController
+        The domain controller to target for the test. The test will attempt to access its SYSVOL share.
+    .PARAMETER PurgeCache
+        Optional. If specified, runs 'klist purge' before the test to ensure a fresh ticket is requested.
+    .PARAMETER TestPath
+        Optional. Custom UNC path to test. Defaults to \\DomainController\SYSVOL.
+    .PARAMETER IncludeTicketInfo
+        Optional. If specified, includes current Kerberos ticket information in the output.
+    .OUTPUTS
+        PSCustomObject indicating the success or failure of the PAC validation test, including detailed diagnostics.
+    .EXAMPLE
+        Test-KerberosPacValidation -DomainController "dc01.contoso.com"
+    .EXAMPLE
+        Test-KerberosPacValidation -DomainController "dc01.contoso.com" -PurgeCache -IncludeTicketInfo
+    .EXAMPLE
+        Test-KerberosPacValidation -DomainController "dc01.contoso.com" -TestPath "\\dc01.contoso.com\netlogon"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController,
+
+        [Parameter()]
+        [switch]$PurgeCache,
+
+        [Parameter()]
+        [string]$TestPath,
+
+        [Parameter()]
+        [switch]$IncludeTicketInfo
+    )
+
+    # Enhanced C# signatures for Win32 API calls with better error handling
+    $signature = @"
+    using System;
+    using System.Runtime.InteropServices;
+    using System.ComponentModel;
+    
+    public class Kernel32 {
+        public const uint GENERIC_READ = 0x80000000;
+        public const uint FILE_SHARE_READ = 0x00000001;
+        public const uint OPEN_EXISTING = 3;
+        public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr CreateFileW(
+            [MarshalAs(UnmanagedType.LPWStr)] string filename,
+            uint access,
+            uint share,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetLastError();
+    }
+
+    public class Advapi32 {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool LogonUser(
+            string username,
+            string domain,
+            string password,
+            int logonType,
+            int logonProvider,
+            out IntPtr token
+        );
+    }
+"@
+
+    # Only add the type if it hasn't been added already
+    if (-not ([System.Management.Automation.PSTypeName]'Kernel32').Type) {
+        Add-Type -TypeDefinition $signature -Language CSharp -ErrorAction Stop
+    }
+
+    # Initialize result object with more comprehensive information
+    $result = [PSCustomObject]@{
+        PSTypeName          = 'Kerberos.PacValidationResult'
+        Success             = $false
+        Action              = $null
+        TestPath            = $null
+        SpnRequested        = $null
+        Win32ErrorCode      = $null
+        ErrorCategory       = $null
+        Message             = ''
+        DetailedDiagnostics = ''
+        TicketInfo          = $null
+        Timestamp           = Get-Date
+        ComputerName        = $env:COMPUTERNAME
+        UserContext         = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    }
+
+    # Set test path - allow override or default to SYSVOL
+     $result.TestPath = if ($PSBoundParameters.ContainsKey('TestPath')) { 
+        $TestPath 
+    } else { 
+        "\\$DomainController\SYSVOL" 
+    }    
+
+    $result.Action = "Win32 API call to open '$($result.TestPath)'"
+    
+    # Extract service from path for SPN determination
+    $targetServer = ($result.TestPath -replace '^\\\\([^\\]+).*$', '$1')
+    $result.SpnRequested = "cifs/$targetServer"
+
+    # Purge cache if requested
+    if ($PurgeCache.IsPresent) {
+        Write-Verbose "Purging Kerberos ticket cache to force fresh authentication..."
+        try { 
+            $purgeResult = & klist.exe purge 2>&1
+            Write-Verbose "Cache purge result: $purgeResult"
+        }
+        catch { 
+            Write-Warning "Failed to purge ticket cache: $($_.Exception.Message)"
+        }
+    }
+
+    # Capture pre-test ticket information if requested
+    if ($IncludeTicketInfo.IsPresent) {
+        try {
+            $ticketOutput = Get-KerberosTicket
+            $result.TicketInfo = @{
+                PreTest = $ticketOutput
+                PostTest = $null
+            }
+        }
+        catch {
+            Write-Verbose "Could not capture ticket information: $($_.Exception.Message)"
+        }
+    }
+
+    $handle = [IntPtr]::Zero
+    try {
+        Write-Verbose "Attempting low-level CreateFileW API call to '$TestPath'..."
+        Write-Verbose "This will trigger Kerberos authentication and PAC validation if successful."
+        
+        # Perform the actual API call
+        $handle = [Kernel32]::CreateFileW(
+            $result.TestPath,
+            [Kernel32]::GENERIC_READ,
+            [Kernel32]::FILE_SHARE_READ,
+            [IntPtr]::Zero,
+            [Kernel32]::OPEN_EXISTING,
+            [Kernel32]::FILE_FLAG_BACKUP_SEMANTICS,
+            [IntPtr]::Zero
+        )
+        
+        if ($handle -eq [Kernel32]::INVALID_HANDLE_VALUE) {
+            # Get the specific error code
+            $errorCode = [Kernel32]::GetLastError()
+            $result.Win32ErrorCode = $errorCode
+            $result.Success = $false
+            
+            # Get standard error message
+            $win32Exception = New-Object System.ComponentModel.Win32Exception($errorCode)
+            $baseErrorMessage = $win32Exception.Message
+
+            # Enhanced error categorization and diagnostics
+            $errorAnalysis = Get-KerberosErrorAnalysis -ErrorCode $errorCode -TestPath $TestPath
+            $result.ErrorCategory = $errorAnalysis.Category
+            $result.Message = "$baseErrorMessage (Win32 Error: $errorCode)"
+            $result.DetailedDiagnostics = $errorAnalysis.Diagnostics
+            
+            Write-Verbose "CreateFileW failed with error code: $errorCode"
+            Write-Verbose "Error category: $($errorAnalysis.Category)"
+        }
+        else {
+            $result.Success = $true
+            $result.ErrorCategory = 'Success'
+            $result.Message = "Successfully accessed the share. Kerberos authentication and PAC validation completed successfully."
+            $result.DetailedDiagnostics = "The server accepted the Kerberos ticket and validated the PAC without issues. The user has appropriate permissions to access the requested resource."
+            
+            Write-Verbose "CreateFileW succeeded - PAC validation appears successful"
+        }
+    }
+    catch {
+        $result.Success = $false
+        $result.ErrorCategory = 'Exception'
+        $result.Message = "PowerShell exception during API call: $($_.Exception.Message)"
+        $result.DetailedDiagnostics = "An unexpected error occurred during the P/Invoke operation. This may indicate a problem with the API call setup or system state."
+        Write-Error "Exception in Test-KerberosPacValidation: $($_.Exception.Message)"
+    }
+    finally {
+        # Always clean up the handle
+        if ($handle -ne [IntPtr]::Zero -and $handle -ne [Kernel32]::INVALID_HANDLE_VALUE) {
+            $closeResult = [Kernel32]::CloseHandle($handle)
+            if (-not $closeResult) {
+                Write-Warning "Failed to close file handle properly"
+            }
+        }
+    }
+
+    # Capture post-test ticket information if requested
+    if ($IncludeTicketInfo.IsPresent -and $result.TicketInfo) {
+        try {
+            $postTicketOutput = Get-KerberosTicket
+            $result.TicketInfo.PostTest = $postTicketOutput
+        }
+        catch {
+            Write-Verbose "Could not capture post-test ticket information: $($_.Exception.Message)"
+        }
+    }
+
+    return $result
+}
+
+
+#-----------------------------------------------------------------------
+# SECTION 3: Main Orchestrator Function
+#-----------------------------------------------------------------------
 function Test-AdvancedKerberos {
 	<#
 	.SYNOPSIS
-		Performs comprehensive Kerberos authentication testing against a Domain Controller or KDC.
-
+		Performs a comprehensive, multi-stage Kerberos diagnostic test.
 	.DESCRIPTION
-		The Test-AdvancedKerberos function conducts thorough testing of Kerberos authentication
-		infrastructure including DNS resolution, TCP connectivity, TGT/TGS ticket requests,
-		time synchronization validation, and optional cross-realm referral testing.
-
-		This function validates the complete Kerberos authentication flow and identifies
-		common configuration issues that could prevent successful authentication.
-
+		Acts as an orchestrator to run a series of Kerberos-related tests in a logical order.
+		It begins with pre-flight checks for prerequisites like DNS, network connectivity, and time sync.
+		If pre-flight checks pass, it proceeds to run deep authentication and ticket validation tests.
+		It provides a rich, color-coded summary to the console for interactive use, and also returns
+		a single, comprehensive object containing all raw test results for programmatic use.
 	.PARAMETER DomainController
-		The Fully Qualified Domain Name (FQDN) of the Domain Controller or Key Distribution Center (KDC) to test.
-		This parameter is mandatory and must be a valid FQDN.
-
+		The FQDN of the Domain Controller to target for the tests.
 	.PARAMETER Credential
-		Optional PSCredential object for alternate credential testing. When provided, the function
-		will attempt Kerberos authentication using these credentials instead of the current user's context.
-		This parameter belongs to the 'UseAlternateCredential' parameter set.
-
-	.PARAMETER TimeoutSeconds
-		Timeout in seconds for TCP connectivity tests between retry attempts. Valid range is 1-30 seconds.
-		Default value is 3 seconds.
-
-	.PARAMETER TargetRealm
-		Optional target realm name for cross-realm referral testing. When provided, the function
-		will attempt to obtain tickets for services in the specified realm after successful
-		local realm authentication.
-
-	.EXAMPLE
-		Test-AdvancedKerberos -DomainController "dc01.contoso.com"
-
-		Performs basic Kerberos testing against dc01.contoso.com using current user credentials.
-
-	.EXAMPLE
-		$cred = Get-Credential
-		Test-AdvancedKerberos -DomainController "dc01.contoso.com" -Credential $cred -TimeoutSeconds 5
-
-		Tests Kerberos authentication using alternate credentials with a 5-second delay between retries.
-
-	.EXAMPLE
-		Test-AdvancedKerberos -DomainController "dc01.contoso.com" -TargetRealm "TRUSTED.COM" -Verbose
-
-		Performs comprehensive testing including cross-realm referral testing with verbose output.
-
-	.NOTES
-		Name: Test-AdvancedKerberos
-		Author: Ryan Whitlock
-		Date: 03.10.2022
-		Version: 1.0
+		Optional PSCredential for running tests with alternate credentials.
+		Note: Some tests like ticket cache validation will be skipped when using alternate credentials.
+	.PARAMETER PurgeTicketCache
+		Optional switch to run 'klist purge' before TGS/SPN validation tests. Use with caution.
 	#>
-
-	[CmdletBinding(DefaultParameterSetName = 'UseCurrentCredential')]
+	[CmdletBinding(DefaultParameterSetName = 'CurrentUser')]
 	param(
 		[Parameter(Mandatory = $true)]
 		[ValidateNotNullOrEmpty()]
 		[string]$DomainController,
 
-		[Parameter(ParameterSetName = 'UseAlternateCredential')]
+		[Parameter(ParameterSetName = 'AlternateCredential')]
 		[System.Management.Automation.PSCredential]$Credential,
 
 		[Parameter()]
-		[ValidateRange(1, 30)]
-		[int]$TimeoutSeconds = 3,
-
-		[Parameter()]
-		[string]$TargetRealm
+		[switch]$PurgeTicketCache
 	)
 
-	begin {
-		# Helper function for DNS resolution
-		function Test-DnsResolution {
-			param([string]$DomainController)
+	# This internal helper standardizes the rich console output.
+	function Write-TestStepResult {
+		param(
+			[string]$TestName,
+			[PSCustomObject]$ResultObject,
+			[string]$SuccessProperty = 'Success',
+			[string]$Details,
+			[string]$StatusOverride
+		)
 
-			Write-Verbose "Resolving DNS for $DomainController"
+		$status = 'FAIL'
+		$color = 'Red'
+		$symbol = '✗'
+		$message = $ResultObject.ErrorMessage
 
-			$result = @{
-				Success = $false
-				ResolvedIPs = @()
-				ErrorMessage = $null
-			}
-
-			try {
-				$addresses = [System.Net.Dns]::GetHostAddresses($DomainController) | Where-Object { $_.AddressFamily -eq 'InterNetwork' }
-				if ($addresses.Count -eq 0) {
-					$result.ErrorMessage = "No IPv4 addresses found for $DomainController"
-				} else {
-					$result.Success = $true
-					$result.ResolvedIPs = $addresses | ForEach-Object { $_.IPAddressToString }
-				}
-			} catch {
-				$result.ErrorMessage = $_.Exception.Message
-			}
-
-			return $result
+		if ($ResultObject.$SuccessProperty) {
+			$status = 'PASS'
+			$color = 'Green'
+			$symbol = '✓'
+			$message = $ResultObject.Message
 		}
 
-		# Helper function for TCP connectivity testing
-		function Test-TcpConnectivity {
-			param(
-				[string]$DomainController,
-				[int]$TimeoutSeconds = 3,
-				[int]$RetryCount = 3
-			)
-
-			$portsToTest = @(
-				@{ Label = 'TcpPort88'; Port = 88 },
-				@{ Label = 'TcpPort389'; Port = 389 },
-				@{ Label = 'TcpPort636'; Port = 636 }
-			)
-
-			$result = @{
-				TcpPort88Open = $false
-				TcpPort389Open = $false
-				TcpPort636Open = $false
-				PortTestDetails = @{}
-			}
-
-			foreach ($portInfo in $portsToTest) {
-				$label = $portInfo.Label
-				$port = $portInfo.Port
-				$success = $false
-				$message = ""
-
-				for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
-					Write-Verbose "Attempt $attempt of $RetryCount for port $port"
-					try {
-						$testResult = Test-NetConnection -ComputerName $DomainController -Port $port -WarningAction SilentlyContinue
-						if ($testResult.TcpTestSucceeded) {
-							$success = $true
-							$message = "Open (TCP response received on attempt $attempt)"
-							break
-						} else {
-							$message = "Attempt $attempt failed: Connection to port $port failed"
-						}
-					} catch {
-						$message = "Attempt $attempt failed: $($_.Exception.Message)"
-					}
-					if ($attempt -lt $RetryCount) {
-						Start-Sleep -Seconds $TimeoutSeconds
-					}
-				}
-
-				$result."$($label)Open" = $success
-				$result.PortTestDetails[$label] = @{
-					Success = $success
-					Message = $message
-				}
-			}
-
-			return $result
-		}
-
-		# Helper function for TGT request
-        function Test-TgtRequest {
-            [CmdletBinding()]
-            param(
-                [Parameter(Mandatory = $true)]
-                [ValidateNotNullOrEmpty()]
-                [string]$DomainController,
-
-                [Parameter(Mandatory = $true)]
-                [ValidateSet('UseCurrentCredential', 'UseAlternateCredential')]
-                [string]$ParameterSetName,
-
-                [Parameter(Mandatory = $false)]
-                [System.Management.Automation.PSCredential]$Credential,
-
-                [Parameter(Mandatory = $false)]
-                [int]$TimeoutSeconds = 30,
-
-                [Parameter(Mandatory = $false)]
-                [switch]$EnableSigning,
-
-                [Parameter(Mandatory = $false)]
-                [switch]$EnableSealing
-            )
-
-            begin {
-                Write-Verbose "Starting enhanced TGT request test against domain controller: $DomainController"
-
-                # Initialize result object with more detailed information
-                $result = [PSCustomObject]@{
-                    DomainController    = $DomainController
-                    TgtRequestStatus    = 'NotTested'
-                    TgtRequestError     = $null
-                    ErrorCategory       = $null
-                    AuthenticationType  = $null
-                    TestDuration        = $null
-                    Timestamp          = Get-Date
-                    DiagnosticInfo     = @{}
-                    AlternativeTests   = @{}
-                }
-
-                # Validate parameters
-                if ($ParameterSetName -eq 'UseAlternateCredential' -and -not $Credential) {
-                    throw [System.ArgumentException]::new("Credential parameter is required when ParameterSetName is 'UseAlternateCredential'")
-                }
-            }
-
-            process {
-                $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                $ldapConn = $null
-
-                try {
-                    # Step 1: Load required assembly
-                    Write-Verbose "Loading System.DirectoryServices.Protocols assembly"
-                    try {
-                        $assemblyLoaded = [System.Reflection.Assembly]::LoadWithPartialName("System.DirectoryServices.Protocols")
-                        if (-not $assemblyLoaded) {
-                            throw [System.InvalidOperationException]::new("Failed to load System.DirectoryServices.Protocols assembly")
-                        }
-                        Write-Verbose "Successfully loaded System.DirectoryServices.Protocols assembly"
-                        $result.DiagnosticInfo['AssemblyLoaded'] = $true
-                    }
-                    catch {
-                        $result.DiagnosticInfo['AssemblyLoaded'] = $false
-                        $result.DiagnosticInfo['AssemblyError'] = $_.Exception.Message
-                        throw [System.InvalidOperationException]::new("Could not load required .NET assembly: $($_.Exception.Message)")
-                    }
-
-                    # Step 2: Test basic connectivity first
-                    Write-Verbose "Testing basic network connectivity to $DomainController"
-                    $connectivityTests = @{}
-            
-                    # Test LDAP port 389
-                    try {
-                        $ldapTest = Test-NetConnection -ComputerName $DomainController -Port 389 -InformationLevel Detailed -WarningAction SilentlyContinue
-                        $connectivityTests['LDAP_389'] = @{
-                            Success = $ldapTest.TcpTestSucceeded
-                            ResponseTime = $ldapTest.PingReplyDetails.RoundtripTime
-                            RemoteAddress = $ldapTest.RemoteAddress
-                        }
-                        Write-Verbose "LDAP (389) connectivity: $($ldapTest.TcpTestSucceeded)"
-                    }
-                    catch {
-                        $connectivityTests['LDAP_389'] = @{
-                            Success = $false
-                            Error = $_.Exception.Message
-                        }
-                    }
-
-                    # Test LDAPS port 636
-                    try {
-                        $ldapsTest = Test-NetConnection -ComputerName $DomainController -Port 636 -InformationLevel Detailed -WarningAction SilentlyContinue
-                        $connectivityTests['LDAPS_636'] = @{
-                            Success = $ldapsTest.TcpTestSucceeded
-                            ResponseTime = $ldapsTest.PingReplyDetails.RoundtripTime
-                            RemoteAddress = $ldapsTest.RemoteAddress
-                        }
-                        Write-Verbose "LDAPS (636) connectivity: $($ldapsTest.TcpTestSucceeded)"
-                    }
-                    catch {
-                        $connectivityTests['LDAPS_636'] = @{
-                            Success = $false
-                            Error = $_.Exception.Message
-                        }
-                    }
-
-                    $result.DiagnosticInfo['ConnectivityTests'] = $connectivityTests
-
-                    # Ensure we can reach LDAP
-                    if (-not $connectivityTests['LDAP_389'].Success) {
-                        throw [System.Net.NetworkInformation.PingException]::new("Cannot reach domain controller $DomainController on port 389 (LDAP)")
-                    }
-
-                    # Step 3: Try alternative authentication methods
-                    Write-Verbose "Attempting multiple authentication approaches"
-            
-                    # Method 1: Try anonymous bind first to test basic LDAP functionality
-                    Write-Verbose "Testing anonymous LDAP bind"
-                    try {
-                        $anonymousConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
-                        $anonymousConn.SessionOptions.ProtocolVersion = 3
-                        $anonymousConn.Timeout = [TimeSpan]::FromSeconds(10)
-                        $anonymousConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
-                        $anonymousConn.Bind()
-                        $result.AlternativeTests['AnonymousBind'] = 'Success'
-                        $anonymousConn.Dispose()
-                        Write-Verbose "Anonymous LDAP bind successful"
-                    }
-                    catch {
-                        $result.AlternativeTests['AnonymousBind'] = "Failed: $($_.Exception.Message)"
-                        Write-Verbose "Anonymous LDAP bind failed: $($_.Exception.Message)"
-                    }
-
-                    # Method 2: Try NTLM authentication
-                    Write-Verbose "Testing NTLM authentication"
-                    try {
-                        $ntlmConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
-                        $ntlmConn.SessionOptions.ProtocolVersion = 3
-                        $ntlmConn.Timeout = [TimeSpan]::FromSeconds(15)
-                        $ntlmConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Ntlm
-                
-                        if ($ParameterSetName -eq 'UseAlternateCredential') {
-                            $ntlmConn.Credential = $Credential.GetNetworkCredential()
-                        }
-                
-                        $ntlmConn.Bind()
-                        $result.AlternativeTests['NtlmAuth'] = 'Success'
-                        $ntlmConn.Dispose()
-                        Write-Verbose "NTLM authentication successful"
-                    }
-                    catch {
-                        $result.AlternativeTests['NtlmAuth'] = "Failed: $($_.Exception.Message)"
-                        Write-Verbose "NTLM authentication failed: $($_.Exception.Message)"
-                    }
-
-                    # Method 3: Try basic authentication
-                    if ($ParameterSetName -eq 'UseAlternateCredential') {
-                        Write-Verbose "Testing Basic authentication with alternate credentials"
-                        try {
-                            $basicConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
-                            $basicConn.SessionOptions.ProtocolVersion = 3
-                            $basicConn.Timeout = [TimeSpan]::FromSeconds(15)
-                            $basicConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Basic
-                            $basicConn.Credential = $Credential.GetNetworkCredential()
-                            $basicConn.Bind()
-                            $result.AlternativeTests['BasicAuth'] = 'Success'
-                            $basicConn.Dispose()
-                            Write-Verbose "Basic authentication successful"
-                        }
-                        catch {
-                            $result.AlternativeTests['BasicAuth'] = "Failed: $($_.Exception.Message)"
-                            Write-Verbose "Basic authentication failed: $($_.Exception.Message)"
-                        }
-                    }
-
-                    # Step 4: Now attempt the actual Kerberos authentication
-                    Write-Verbose "Creating LDAP connection for Kerberos authentication"
-                    $ldapConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
-
-                    # Configure connection properties
-                    $ldapConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Kerberos
-                    $ldapConn.SessionOptions.ProtocolVersion = 3
-                    $ldapConn.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
-
-                    # Try different security settings
-                    $securityConfigurations = @(
-                        @{ Signing = $false; Sealing = $false; Description = "No signing/sealing" },
-                        @{ Signing = $true; Sealing = $false; Description = "Signing only" },
-                        @{ Signing = $true; Sealing = $true; Description = "Signing and sealing" }
-                    )
-
-                    $kerberosSuccess = $false
-                    foreach ($config in $securityConfigurations) {
-                        if ($kerberosSuccess) { break }
-                
-                        Write-Verbose "Trying Kerberos with configuration: $($config.Description)"
-                
-                        try {
-                            # Reset connection
-                            if ($ldapConn) { $ldapConn.Dispose() }
-                            $ldapConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
-                            $ldapConn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Kerberos
-                            $ldapConn.SessionOptions.ProtocolVersion = 3
-                            $ldapConn.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
-
-                            # Apply security settings
-                            $ldapConn.SessionOptions.Signing = $config.Signing
-                            $ldapConn.SessionOptions.Sealing = $config.Sealing
-
-                            # Configure credentials
-                            if ($ParameterSetName -eq 'UseAlternateCredential') {
-                                Write-Verbose "Configuring alternate credentials for Kerberos authentication"
-                                $result.AuthenticationType = "AlternateCredential ($($Credential.UserName))"
-                                $netCred = $Credential.GetNetworkCredential()
-                                $ldapConn.Credential = $netCred
-                            }
-                            else {
-                                Write-Verbose "Using current user credentials for Kerberos authentication"
-                                $result.AuthenticationType = "CurrentUser ($([System.Security.Principal.WindowsIdentity]::GetCurrent().Name))"
-                            }
-
-                            # Attempt the bind operation
-                            Write-Verbose "Attempting Kerberos bind with $($config.Description)"
-                            $ldapConn.Bind()
-
-                            # If we get here, the bind was successful
-                            $result.TgtRequestStatus = 'Success'
-                            $result.DiagnosticInfo['SuccessfulConfiguration'] = $config.Description
-                            $kerberosSuccess = $true
-                            Write-Verbose "TGT request completed successfully with $($config.Description)"
-                            break
-                        }
-                        catch {
-                            $result.DiagnosticInfo["KerberosAttempt_$($config.Description.Replace(' ', '_'))"] = $_.Exception.Message
-                            Write-Verbose "Kerberos attempt with $($config.Description) failed: $($_.Exception.Message)"
-                        }
-                    }
-
-                    if (-not $kerberosSuccess) {
-                        throw [System.Security.Authentication.AuthenticationException]::new("All Kerberos authentication methods failed")
-                    }
-                }
-                catch [System.DirectoryServices.Protocols.LdapException] {
-                    $result.TgtRequestStatus = 'Failure'
-                    $result.ErrorCategory = 'LdapError'
-                    $result.TgtRequestError = "LDAP Error: $($_.Exception.Message) (Error Code: $($_.Exception.ErrorCode))"
-                    $result.DiagnosticInfo['LdapErrorCode'] = $_.Exception.ErrorCode
-                    $result.DiagnosticInfo['LdapServerErrorMessage'] = $_.Exception.ServerErrorMessage
-                    Write-Verbose "LDAP-specific error during TGT request: $($result.TgtRequestError)"
-                }
-                catch [System.Security.Authentication.AuthenticationException] {
-                    $result.TgtRequestStatus = 'Failure'
-                    $result.ErrorCategory = 'AuthenticationError'
-                    $result.TgtRequestError = "Authentication failed: $($_.Exception.Message)"
-                    Write-Verbose "Authentication error during TGT request: $($result.TgtRequestError)"
-                }
-                catch [System.Net.NetworkInformation.PingException] {
-                    $result.TgtRequestStatus = 'Failure'
-                    $result.ErrorCategory = 'NetworkError'
-                    $result.TgtRequestError = "Network connectivity issue: $($_.Exception.Message)"
-                    Write-Verbose "Network error during TGT request: $($result.TgtRequestError)"
-                }
-                catch [System.TimeoutException] {
-                    $result.TgtRequestStatus = 'Failure'
-                    $result.ErrorCategory = 'TimeoutError'
-                    $result.TgtRequestError = "Operation timed out after $TimeoutSeconds seconds: $($_.Exception.Message)"
-                    Write-Verbose "Timeout error during TGT request: $($result.TgtRequestError)"
-                }
-                catch [System.InvalidOperationException] {
-                    $result.TgtRequestStatus = 'Failure'
-                    $result.ErrorCategory = 'ConfigurationError'
-                    $result.TgtRequestError = "Configuration or setup error: $($_.Exception.Message)"
-                    Write-Verbose "Configuration error during TGT request: $($result.TgtRequestError)"
-                }
-                catch {
-                    $result.TgtRequestStatus = 'Failure'
-                    $result.ErrorCategory = 'UnexpectedError'
-                    $result.TgtRequestError = "Unexpected error: $($_.Exception.Message)"
-                    $result.DiagnosticInfo['UnexpectedErrorType'] = $_.Exception.GetType().Name
-                    $result.DiagnosticInfo['UnexpectedErrorHResult'] = $_.Exception.HResult
-                    Write-Verbose "Unexpected error during TGT request: $($result.TgtRequestError)"
-                    Write-Debug "Full exception details: $($_ | Out-String)"
-                }
-                finally {
-                    # Ensure proper cleanup
-                    if ($ldapConn) {
-                        try {
-                            $ldapConn.Dispose()
-                            Write-Verbose "LDAP connection disposed successfully"
-                        }
-                        catch {
-                            Write-Warning "Failed to dispose LDAP connection: $($_.Exception.Message)"
-                        }
-                    }
-
-                    $stopwatch.Stop()
-                    $result.TestDuration = $stopwatch.Elapsed
-                    Write-Verbose "TGT request test completed in $($result.TestDuration.TotalMilliseconds) milliseconds"
-                }
-            }
-
-            end {
-                return $result
-            }
-        }
-
-		# Helper function for TGS and SPN validation
-        function Test-TgsAndSpnValidation {
-            param(
-                [string]$DomainController,
-                [System.Management.Automation.PSCredential]$Credential
-            )
-
-            $result = @{
-                TgsRequestStatus    = 'NotTested'
-                TgsRequestError     = $null
-                SpnValidationStatus = 'NotTested'
-                SpnValidationError  = $null
-                EncryptionType      = 'Unknown'
-            }
-
-            # CAVEAT: klist.exe can only inspect the ticket cache of the current user's logon session.
-            if ($PSBoundParameters.ContainsKey('Credential')) {
-                Write-Verbose "Skipping TGS/SPN validation: klist.exe cannot inspect ticket cache for alternate credentials."
-                $result.TgsRequestStatus = 'Skipped'
-                $result.TgsRequestError = 'klist.exe cannot be used with alternate credentials.'
-                $result.SpnValidationStatus = 'Skipped'
-                return $result
-            }
-
-            try {
-                # Step 1: Purge the existing ticket cache to ensure we get a fresh ticket.
-                Write-Verbose "Purging Kerberos ticket cache with 'klist purge'."
-                $purgeProcess = Start-Process -FilePath "klist.exe" -ArgumentList "purge" -Wait -PassThru -NoNewWindow
-                if ($purgeProcess.ExitCode -ne 0) {
-                    Write-Warning "klist purge exited with code $($purgeProcess.ExitCode). Proceeding with test."
-                }
-
-                # Step 2: Trigger a Kerberos-based action to get a service ticket for the DC's LDAP service.
-                Write-Verbose "Triggering new service ticket request for LDAP/$DomainController"
-                Get-ADRootDSE -Server $DomainController -ErrorAction Stop | Out-Null
-                $result.TgsRequestStatus = 'Success'
-                Write-Verbose "Successfully contacted the LDAP service, TGS request is considered successful."
-
-            } catch {
-                $result.TgsRequestStatus = 'Failure'
-                $result.TgsRequestError = "Failed to get a service ticket for LDAP/$DomainController. Error: $($_.Exception.Message)"
-                $result.SpnValidationStatus = 'Failure'
-                $result.SpnValidationError = "Could not validate SPN because the TGS request failed."
-                Write-Verbose "TGS request failed: $($_.Exception.Message)"
-                return $result
-            }
-
-            try {
-                # Step 3: Inspect the cache with klist.exe using reliable line-by-line parsing.
-                Write-Verbose "Analyzing new ticket cache with 'klist tickets'."
-                $klistOutput = klist.exe tickets
-                $klistLines = $klistOutput -split '\r?\n'
-
-                $spnPattern = "ldap/$DomainController"
-                $foundTicket = $false
-                $encryptionTypeFound = $false
-
-                for ($i = 0; $i -lt $klistLines.Length; $i++) {
-                    # Find the line with the server SPN we are looking for.
-                    # We match against the start of the SPN to avoid aliasing issues.
-                    if ($klistLines[$i] -match "Server:\s*$([regex]::Escape($spnPattern))") {
-                        Write-Verbose "Found ticket section for SPN: $spnPattern"
-                        $foundTicket = $true
-
-                        # Now search from this line forward for the encryption type within the same ticket block.
-                        for ($j = $i + 1; $j -lt $klistLines.Length; $j++) {
-                            # Stop searching if we hit the start of the next ticket or the end of the list.
-                            if ($klistLines[$j] -match '^\s*#\d+>' -or [string]::IsNullOrWhiteSpace($klistLines[$j])) {
-                                Write-Verbose "Reached end of ticket section without finding encryption type."
-                                break # Exit inner loop
-                            }
-
-                            # Find the encryption type line and capture its value.
-                            if ($klistLines[$j] -match "KerbTicket Encryption Type:\s*(.+)") {
-                                $result.EncryptionType = $matches[1].Trim()
-                                $encryptionTypeFound = $true
-                                Write-Verbose "Found encryption type: $($result.EncryptionType)"
-                                break # Exit inner loop, we found what we need.
-                            }
-                        }
-                        break # Exit outer loop, we've processed the ticket we care about.
-                    }
-                }
-
-                # Final validation based on what we found during parsing.
-                if ($foundTicket -and $encryptionTypeFound) {
-                    $result.SpnValidationStatus = 'Success'
-                    $result.SpnValidationError = "A valid ticket for SPN '$spnPattern' was found with its encryption type."
-                } elseif ($foundTicket) { # We found the ticket but not the e-type
-                    $result.SpnValidationStatus = 'Success' # Finding the ticket is a success in itself.
-                    $result.SpnValidationError = "Found ticket for SPN '$spnPattern', but could not parse its encryption type."
-                    $result.EncryptionType = 'Parse Failed'
-                } else { # We never found the ticket
-                    $result.SpnValidationStatus = 'Failure'
-                    $result.SpnValidationError = "TGS request succeeded, but could not find a matching ticket for '$spnPattern' in the klist output."
-                    $result.EncryptionType = 'Not Found'
-                }
-
-            } catch {
-                $result.SpnValidationStatus = 'Failure'
-                $result.SpnValidationError = "An error occurred while running or parsing klist.exe: $($_.Exception.Message)"
-                Write-Verbose "Error during klist analysis: $($_.Exception.Message)"
-            }
-
-            return $result
-        }
-
-        # Helper function for time synchronization check
-        function Test-TimeSynchronization {
-            param([string]$DomainController)
-            Write-Verbose "Checking time synchronization with Domain Controller using w32tm"
-            $result = @{
-                TimeSkewSeconds = $null
-                TimeSkewWarning = $false
-                TimeSkewMessage = $null
-            }
-            try {
-                # Use w32tm to check time synchronization
-                Write-Verbose "Running w32tm stripchart against $DomainController"
-                $w32tmResult = w32tm /stripchart /computer:$DomainController /samples:1 /dataonly
-        
-                if ($w32tmResult) {
-                    Write-Verbose "w32tm output: $($w32tmResult -join ' ')"
-            
-                    # Parse the w32tm output to extract time offset
-                    # w32tm output format is typically: "dd/mm/yyyy HH:mm:ss, +/-X.Xs"
-                    $offsetLine = $w32tmResult | Where-Object { $_ -match '[\+\-]\d+\.\d+s' }
-            
-                    if ($offsetLine) {
-                        # Extract the time offset value
-                        if ($offsetLine -match '([\+\-]\d+\.\d+)s') {
-                            $timeSkew = [math]::Abs([double]$matches[1])
-                            $result.TimeSkewSeconds = $timeSkew
-                    
-                            Write-Verbose "Time skew detected: $timeSkew seconds"
-                    
-                            if ($timeSkew -gt 300) {
-                                $result.TimeSkewWarning = $true
-                                $result.TimeSkewMessage = "Local vs. DC clock differ by $timeSkew seconds. Kerberos likely to fail."
-                            } else {
-                                $result.TimeSkewWarning = $false
-                                $result.TimeSkewMessage = "Time synchronization within acceptable range ($timeSkew seconds)"
-                            }
-                        } else {
-                            $result.TimeSkewWarning = $true
-                            $result.TimeSkewMessage = "Unable to parse time offset from w32tm output"
-                        }
-                    } else {
-                        $result.TimeSkewWarning = $true
-                        $result.TimeSkewMessage = "No time offset information found in w32tm output"
-                    }
-                } else {
-                    $result.TimeSkewWarning = $true
-                    $result.TimeSkewMessage = "w32tm command returned no output"
-                }
-            } catch {
-                $result.TimeSkewWarning = $true
-                $result.TimeSkewMessage = "Unable to check time synchronization: $($_.Exception.Message)"
-                Write-Verbose "Error running w32tm: $($_.Exception.Message)"
-            }
-            return $result
-        }
-
-		# Helper function for cross-realm testing
-		function Test-CrossRealmReferral {
-			param(
-				[string]$TargetRealm,
-				[string]$TgtRequestStatus
-			)
-
-			$result = @{
-				CrossRealmStatus = 'NotTested'
-				CrossRealmErrors = @()
-			}
-
-			if (-not $TargetRealm) {
-				return $result
-			}
-
-			Write-Verbose "Performing cross-realm referral tests for realm: $TargetRealm"
-
-			try {
-				if ($TgtRequestStatus -eq 'Success') {
-					$crossRealmSpn = "krbtgt/$TargetRealm"
-					Write-Verbose "Testing cross-realm referral for: $crossRealmSpn"
-
-					# Placeholder for actual cross-realm test
-					try {
-						$targetRealmTest = [System.Net.Dns]::GetHostAddresses("$TargetRealm")
-						if ($targetRealmTest) {
-							$result.CrossRealmStatus = 'Success'
-							Write-Verbose "Cross-realm referral test successful"
-						} else {
-							$result.CrossRealmStatus = 'Failure'
-							$result.CrossRealmErrors += "Target realm $TargetRealm not resolvable"
-							Write-Verbose "Cross-realm referral test failed - realm not resolvable"
-						}
-					} catch {
-						$result.CrossRealmStatus = 'Failure'
-						$result.CrossRealmErrors += "Cross-realm test failed: $($_.Exception.Message)"
-						Write-Verbose "Cross-realm referral test failed: $($_.Exception.Message)"
-					}
-				} else {
-					$result.CrossRealmStatus = 'Failure'
-					$result.CrossRealmErrors += "Cannot perform cross-realm test without successful local TGT"
-					Write-Verbose "Skipping cross-realm test due to local TGT failure"
-				}
-			} catch {
-				$result.CrossRealmStatus = 'Failure'
-				$result.CrossRealmErrors += $_.Exception.Message
-				Write-Verbose "Cross-realm test error: $($_.Exception.Message)"
-			}
-
-			return $result
-		}
-
-		# Helper function to determine overall status
-		function Get-OverallStatus {
-			param([hashtable]$TestResults)
-
-			$criticalFailures = @()
-
-			if ($TestResults.DnsResolutionError) {
-				$criticalFailures += "DNS Resolution Failed"
-			}
-			if (-not $TestResults.TcpPort88Open) {
-				$criticalFailures += "Kerberos Port 88 Closed"
-			}
-			if ($TestResults.TgtRequestStatus -eq 'Failure') {
-				$criticalFailures += "TGT Request Failed"
-			}
-			if ($TestResults.TimeSkewWarning -and $TestResults.TimeSkewSeconds -gt 300) {
-				$criticalFailures += "Time Synchronization Issue"
-			}
-
-			if ($criticalFailures.Count -eq 0) {
-				return 'Success'
-			} elseif ($TestResults.TgtRequestStatus -eq 'Success') {
-				return 'Partial'
-			} else {
-				return 'Failed'
+		if ($PSBoundParameters.ContainsKey('StatusOverride')) {
+			$status = $StatusOverride
+			switch ($status) {
+				'WARN' { $color = 'Yellow'; $symbol = '⚠' }
+				'INFO' { $color = 'Cyan'; $symbol = 'ℹ' }
 			}
 		}
 
-		function Test-KerberosPort {
-			<#
-			.SYNOPSIS
-				Tests Kerberos AS-REQ reachability (UDP) to a KDC on port 88 (or specified port).
+		Write-Host (" " * 2) -NoNewline
+		Write-Host "[$symbol] " -ForegroundColor $color -NoNewline
+		Write-Host $TestName
 
-			.DESCRIPTION
-				Builds a minimal ASN.1-encoded KERBEROS_AS_REQ and sends it over UDP to the specified server:port.
-				Waits up to $TimeoutMs ms for an AS-REP or KRB-ERROR. Returns a PSCustomObject with Success/$true/false,
-				error details, response time, size, and analysis (Type/ErrorCode/etc).
-
-			.PARAMETER Server
-				FQDN or host name of the target KDC. If -Realm is omitted, the realm is auto-derived from $Server
-				(using the last two labels, e.g., "dc01.sub.example.com" derives "EXAMPLE.COM"). Specify -Realm
-				explicitly if this derivation is incorrect.
-
-			.PARAMETER Port
-				UDP port for Kerberos (default 88). (This uses UDP only; does not attempt TCP.)
-
-			.PARAMETER Realm
-				Kerberos realm (uppercase), e.g. EXAMPLE.COM. If omitted, derived from $Server.
-
-			.PARAMETER ClientName
-				Client principal (short name). If not specified, uses the current logged-in user's username.
-				Must exist in KDC's DB for a valid AS-REP response.
-
-			.PARAMETER TimeoutMs
-				Max milliseconds to wait for a UDP response (default 5000).
-
-			.NOTES
-				Requires .NET's System.Net.Sockets.UdpClient. Minimal ASN.1—multi-component principal names split on "/".
-
-			.EXAMPLE
-				Test-KerberosPort -Server dc01.example.com -Verbose
-			#>
-			[CmdletBinding()]
-			param(
-				[Parameter(Mandatory, Position=0)]
-				[ValidateNotNullOrEmpty()]
-				[string]$Server,
-
-				[ValidateRange(1,65535)]
-				[int]$Port = 88,
-
-				[ValidateNotNullOrEmpty()]
-				[string]$Realm = $null,
-
-				[Parameter()]
-				[string]$ClientName = $null,
-
-				[ValidateRange(100,60000)]
-				[int]$TimeoutMs = 5000
-			)
-
-			begin {
-				# If you extract these to a module, you can remove them from here.
-				function Write-ASN1Length {
-					param([int]$Length)
-					if ($Length -lt 128) {
-						return @([byte]$Length)
-					} else {
-						$bytes = @()
-						$temp = $Length
-						while ($temp -gt 0) {
-							$bytes = ,([byte]($temp -band 0xFF)) + $bytes
-							$temp = $temp -shr 8
-						}
-						$prefixByte = [byte](0x80 + $bytes.Length)
-						return ,$prefixByte + $bytes
-					}
-				}
-
-				function Write-ASN1Integer {
-					param([int]$Value)
-					if ($Value -eq 0) {
-						$intBytes = @([byte]0)
-					} else {
-						# Minimal big-endian
-						$absVal = [Math]::Abs($Value)
-						$bytes = @()
-						while ($absVal -gt 0) {
-							$bytes = ,([byte]($absVal -band 0xFF)) + $bytes
-							$absVal = $absVal -shr 8
-						}
-						# Pad if MSB set & positive
-						if ($Value -ge 0 -and ($bytes[0] -band 0x80)) {
-							$bytes = ,([byte]0) + $bytes
-						}
-						# TODO: handle negative two's complement if you ever pass negative
-						$intBytes = $bytes
-					}
-					$lenBytes = Write-ASN1Length $intBytes.Length
-					return ,([byte]0x02) + $lenBytes + $intBytes
-				}
-
-				function Write-ASN1BitString {
-					param([byte[]]$Bits)
-					if (-not $Bits -or $Bits.Length -le 0) {
-						throw "BitString data cannot be null or empty"
-					}
-					$unusedBits = 0
-					$content   = ,([byte]$unusedBits) + $Bits
-					$lenBytes  = Write-ASN1Length $content.Length
-					return ,([byte]0x03) + $lenBytes + $content
-				}
-
-				function Write-ASN1KerberosTime {
-					param([DateTime]$Time)
-					$timeStr   = $Time.ToUniversalTime().ToString("yyyyMMddHHmmssZ")
-					$bytes     = [Text.Encoding]::ASCII.GetBytes($timeStr)
-					$lenBytes  = Write-ASN1Length $bytes.Length
-					return ,([byte]0x18) + $lenBytes + $bytes
-				}
-
-				function Write-ASN1KerberosString {
-					param([string]$Str)
-					if ([string]::IsNullOrEmpty($Str)) {
-						throw "Kerberos string cannot be null or empty"
-					}
-					$bytes    = [Text.Encoding]::ASCII.GetBytes($Str)
-					$lenBytes = Write-ASN1Length $bytes.Length
-					return ,([byte]0x1B) + $lenBytes + $bytes
-				}
-
-				function Write-ASN1Sequence {
-					param(
-						[Parameter(Mandatory)]
-						[byte[]]$ContentBytes
-					)
-					$lenBytes = Write-ASN1Length $ContentBytes.Length
-					return ,([byte]0x30) + $lenBytes + $ContentBytes
-				}
-
-				function Write-ASN1SequenceOf {
-					param(
-						[Parameter(Mandatory)]
-						[byte[][]]$Elements
-					)
-					$aggregate = @()
-					foreach ($el in $Elements) {
-						$aggregate += $el
-					}
-					return Write-ASN1Sequence -ContentBytes $aggregate
-				}
-
-				function Build-PrincipalsStringArray {
-					param([string]$PrincipalName)
-					$parts = $PrincipalName.Split('/')
-					if ($parts.Count -eq 0) {
-						throw "PrincipalName cannot be empty"
-					}
-					$out = @()
-					foreach ($component in $parts) {
-						if (-not [string]::IsNullOrEmpty($component)) {
-							$out += Write-ASN1KerberosString $component
-						} else {
-							throw "Empty component in principal: '$PrincipalName'"
-						}
-					}
-					return $out
-				}
-
-				function Build-PrincipalName {
-					param(
-						[Parameter(Mandatory)]
-						[string]$Name,
-						[int]$NameType = 1
-					)
-					# Tag [0] = name-type
-					$ntBytes   = Write-ASN1Integer $NameType
-					$ntSection = ,([byte]0xA0) + (Write-ASN1Length $ntBytes.Length) + $ntBytes
-
-					# Tag [1] = name-string (sequence of GeneralString)
-					$stringElems = Build-PrincipalsStringArray -PrincipalName $Name
-					$stringSeq   = Write-ASN1SequenceOf $stringElems
-					$nsSection   = ,([byte]0xA1) + (Write-ASN1Length $stringSeq.Length) + $stringSeq
-
-					# Combine into a SEQUENCE
-					$combined = $ntSection + $nsSection
-					return Write-ASN1Sequence -ContentBytes $combined
-				}
-
-				function Get-KerberosErrorDescription {
-					param([int]$ErrorCode)
-					$map = @{
-						1  = "KDC_ERR_NAME_EXP - Client expired"
-						2  = "KDC_ERR_SERVICE_EXP - Server expired"
-						3  = "KDC_ERR_BAD_PVNO - Bad protocol version"
-						6  = "KDC_ERR_C_PRINCIPAL_UNKNOWN - Client not found"
-						7  = "KDC_ERR_S_PRINCIPAL_UNKNOWN - Server not found"
-						8  = "KDC_ERR_PRINCIPAL_NOT_UNIQUE - Multiple entries"
-						12 = "KDC_ERR_NEVER_VALID - Ticket not yet valid"
-						18 = "KDC_ERR_CLIENT_REVOKED"
-						23 = "KDC_ERR_KEY_EXPIRED"
-						24 = "KDC_ERR_PREAUTH_FAILED"
-						25 = "KDC_ERR_PREAUTH_REQUIRED"
-						32 = "KDC_ERR_SKEW - Clock skew too great"
-						68 = "KDC_ERR_WRONG_REALM"
-					}
-
-					if ($map.ContainsKey($ErrorCode)) { 
-						return $map[$ErrorCode] 
-					} else { 
-						return "Unknown error code: $ErrorCode" 
-					}
-				}
-
-				function Find-KerberosErrorCode {
-					param(
-						[byte[]]$ResponseBytes
-					)
-
-					Write-Verbose "Searching for error code in $($ResponseBytes.Length) bytes"
-			
-					# For debugging, show first few bytes
-					if ($ResponseBytes.Length -gt 0) {
-						$firstBytes = ($ResponseBytes[0..[Math]::Min(31, $ResponseBytes.Length-1)] | ForEach-Object { "{0:X2}" -f $_ }) -join ' '
-						Write-Verbose "Response bytes: $firstBytes"
-					}
-
-					# KRB-ERROR ASN.1 structure (simplified):
-					# KRB-ERROR ::= [APPLICATION 30] SEQUENCE {
-					#     pvno [0] INTEGER (5),
-					#     msg-type [1] INTEGER (30),
-					#     ctime [2] KerberosTime OPTIONAL,
-					#     cusec [3] Microseconds OPTIONAL,
-					#     stime [4] KerberosTime,
-					#     susec [5] Microseconds,
-					#     error-code [6] Int32,         <-- This is what we want!
-					#     crealm [7] Realm OPTIONAL,
-					#     cname [8] PrincipalName OPTIONAL,
-					#     realm [9] Realm,
-					#     sname [10] PrincipalName,
-					#     e-text [11] KerberosString OPTIONAL,
-					#     e-data [12] OCTET STRING OPTIONAL
-					# }
-			
-					# We need to find context-specific tag [6] which is 0x86 (constructed) or 0x86 (primitive)
-					# Actually, [6] in context-specific is 0xA6 for constructed, 0x86 for primitive
-			
-					$integerCount = 0
-					$foundIntegers = @()
-			
-					for ($i = 0; $i -lt $ResponseBytes.Length - 2; $i++) {
-						# Look specifically for context-specific tag [6] = 0xA6
-						if ($ResponseBytes[$i] -eq 0xA6) {
-							Write-Verbose "Found context-specific tag [6] at position $i"
-					
-							# Parse length
-							$lengthPos = $i + 1
-							if ($lengthPos -ge $ResponseBytes.Length) { continue }
-					
-							$lenByte = $ResponseBytes[$lengthPos]
-							$contentStart = 0
-							$contentLength = 0
-					
-							if ($lenByte -lt 0x80) {
-								$contentLength = $lenByte
-								$contentStart = $lengthPos + 1
-							} else {
-								$numLenBytes = $lenByte -band 0x7F
-								if ($numLenBytes -eq 0 -or $numLenBytes -gt 4 -or ($lengthPos + $numLenBytes) -ge $ResponseBytes.Length) {
-									continue
-								}
-						
-								$contentLength = 0
-								for ($j = 0; $j -lt $numLenBytes; $j++) {
-									$contentLength = ($contentLength -shl 8) -bor $ResponseBytes[$lengthPos + 1 + $j]
-								}
-								$contentStart = $lengthPos + 1 + $numLenBytes
-							}
-					
-							# Verify bounds
-							if ($contentStart + $contentLength -gt $ResponseBytes.Length) {
-								continue
-							}
-					
-							# The content should be an INTEGER (tag 0x02)
-							if ($contentStart -lt $ResponseBytes.Length -and $ResponseBytes[$contentStart] -eq 0x02) {
-								$intLen = $ResponseBytes[$contentStart + 1]
-								if ($intLen -gt 0 -and $contentStart + 1 + $intLen -le $ResponseBytes.Length) {
-									$intBytes = $ResponseBytes[($contentStart + 2)..($contentStart + 1 + $intLen)]
-									$errorCode = 0
-									foreach ($byte in $intBytes) {
-										$errorCode = ($errorCode -shl 8) -bor $byte
-									}
-									Write-Verbose "Found error code in [6]: $errorCode"
-									return $errorCode
-								}
-							}
-						}
-					}
-			
-					# Fallback: collect all integers and try to identify the error code
-					# Skip the first few integers (likely pvno=5, msg-type=30)
-					Write-Verbose "Fallback: collecting all integers in the message"
-			
-					for ($i = 0; $i -lt $ResponseBytes.Length - 2; $i++) {
-						if ($ResponseBytes[$i] -eq 0x02) {
-							$intLen = $ResponseBytes[$i + 1]
-							if ($intLen -gt 0 -and $intLen -le 4 -and $i + 1 + $intLen -lt $ResponseBytes.Length) {
-								$intBytes = $ResponseBytes[($i + 2)..($i + 1 + $intLen)]
-								$value = 0
-								foreach ($byte in $intBytes) {
-									$value = ($value -shl 8) -bor $byte
-								}
-								$foundIntegers += $value
-								Write-Verbose "Found INTEGER at position $i`: $value"
-							}
-						}
-					}
-			
-					# Analyze the integers we found
-					if ($foundIntegers.Count -gt 0) {
-						Write-Verbose "Found integers: $($foundIntegers -join ', ')"
-				
-						# Skip known values: pvno (5), msg-type (30), and look for reasonable error codes
-						$candidateErrors = $foundIntegers | Where-Object { 
-							$_ -ne 5 -and $_ -ne 30 -and $_ -gt 0 -and $_ -lt 100 
-						}
-				
-						if ($candidateErrors.Count -gt 0) {
-							# If we have multiple candidates, take the first one that's not 5 or 30
-							$errorCode = $candidateErrors[0]
-							Write-Verbose "Selected error code from candidates: $errorCode"
-							return $errorCode
-						}
-					}
-
-					Write-Verbose "No error code found in response"
-					return $null
-				}
-
-				function Analyze-KerberosResponse {
-					[CmdletBinding()]
-					param(
-						[Parameter(Mandatory)]
-						[byte[]]$ResponseBytes
-					)
-					if (-not $ResponseBytes -or $ResponseBytes.Length -eq 0) {
-						return [PSCustomObject]@{
-							Type        = 'EMPTY_RESPONSE'
-							Valid       = $false
-							Description = 'No response data received'
-						}
-					}
-					$firstByte = $ResponseBytes[0]
-					Write-Verbose ("First byte of response: 0x{0:X2}" -f $firstByte)
-			
-					switch ($firstByte) {
-						0x6B { # AS-REP
-							$analysis = [PSCustomObject]@{
-								Type        = 'AS-REP'
-								Valid       = $true
-								Description = 'Authentication successful'
-								ErrorCode   = $null
-								ErrorDesc   = $null
-								FirstBytes  = $null
-							}
-						}
-						0x7E { # KRB-ERROR
-							Write-Verbose "Detected KRB-ERROR response, extracting error code..."
-							$errorCode = Find-KerberosErrorCode -ResponseBytes $ResponseBytes
-							$analysis  = [PSCustomObject]@{
-								Type        = 'KRB-ERROR'
-								Valid       = $true
-								Description = 'Kerberos Error Response'
-								ErrorCode   = $errorCode
-								ErrorDesc   = if ($errorCode -ne $null) { Get-KerberosErrorDescription $errorCode } else { "Could not extract error code" }
-								FirstBytes  = $null
-							}
-						}
-						default {
-							$first16 = ($ResponseBytes[0..[Math]::Min(15, $ResponseBytes.Length-1)] | ForEach-Object { "{0:X2}" -f $_ }) -join ' '
-							$analysis = [PSCustomObject]@{
-								Type        = 'UNKNOWN'
-								Valid       = $false
-								Description = "Unrecognized response format (first byte: 0x{0:X2})" -f $firstByte
-								ErrorCode   = $null
-								ErrorDesc   = $null
-								FirstBytes  = $first16
-							}
-						}
-					}
-
-					Write-Verbose "Response Analysis:"
-					Write-Verbose "  Type       : $($analysis.Type)"
-					Write-Verbose "  Valid      : $($analysis.Valid)"
-					Write-Verbose "  Description: $($analysis.Description)"
-					if ($analysis.ErrorCode -ne $null) {
-						Write-Verbose "  ErrorCode  : $($analysis.ErrorCode) - $($analysis.ErrorDesc)"
-					}
-					if ($analysis.FirstBytes) {
-						Write-Verbose "  FirstBytes : $($analysis.FirstBytes)"
-					}
-					return $analysis
-				}
-
-				function Build-KerberosASREQ {
-					[CmdletBinding()]
-					param(
-						[Parameter(Mandatory)]
-						[string]$ClientName,
-
-						[Parameter(Mandatory)]
-						[string]$Realm,
-
-						[string]$ServerName = $null,
-
-						[DateTime]$TillTime = (Get-Date).ToUniversalTime().AddHours(24),
-
-						[int[]]$EncryptionTypes = @(18,17,23)
-					)
-					# Validate
-					if ([string]::IsNullOrWhiteSpace($ClientName)) {
-						throw "ClientName cannot be empty"
-					}
-					if ([string]::IsNullOrWhiteSpace($Realm)) {
-						throw "Realm cannot be empty"
-					}
-					if ([string]::IsNullOrWhiteSpace($ServerName)) {
-						$ServerName = "krbtgt/$Realm"
-					}
-					# Nonce (32-bit positive)
-					$nonce = Get-Random -Minimum 1000000 -Maximum 2147483647
-
-					# 1. kdc-options [0] => 32-bit zero bitstring
-					$zeroBytes       = [byte[]](0,0,0,0)
-					$kdcOptionsBytes = Write-ASN1BitString -Bits $zeroBytes
-					$kdcOptionsSec   = ,([byte]0xA0) + (Write-ASN1Length $kdcOptionsBytes.Length) + $kdcOptionsBytes
-
-					# 2. cname [1]
-					$cnameBytes     = Build-PrincipalName -Name $ClientName -NameType 1
-					$cnameSection   = ,([byte]0xA1) + (Write-ASN1Length $cnameBytes.Length) + $cnameBytes
-
-					# 3. realm [2]
-					$realmBytes    = Write-ASN1KerberosString -Str $Realm
-					$realmSection  = ,([byte]0xA2) + (Write-ASN1Length $realmBytes.Length) + $realmBytes
-
-					# 4. sname [3]
-					$snameBytes    = Build-PrincipalName -Name $ServerName -NameType 2
-					$snameSection  = ,([byte]0xA3) + (Write-ASN1Length $snameBytes.Length) + $snameBytes
-
-					# 5. till [5]
-					$tillBytes     = Write-ASN1KerberosTime -Time $TillTime
-					$tillSection   = ,([byte]0xA5) + (Write-ASN1Length $tillBytes.Length) + $tillBytes
-
-					# 6. nonce [7]
-					$nonceBytes    = Write-ASN1Integer -Value $nonce
-					$nonceSection  = ,([byte]0xA7) + (Write-ASN1Length $nonceBytes.Length) + $nonceBytes
-
-					# 7. etype [8]
-					$etypeInts     = foreach ($e in $EncryptionTypes) { Write-ASN1Integer -Value $e }
-					$etypeSeq      = Write-ASN1SequenceOf -Elements $etypeInts
-					$etypeSection  = ,([byte]0xA8) + (Write-ASN1Length $etypeSeq.Length) + $etypeSeq
-
-					# Combine req-body
-					$reqBodyContent = $kdcOptionsSec + $cnameSection + $realmSection + $snameSection + $tillSection + $nonceSection + $etypeSection
-					$reqBodySeq     = Write-ASN1Sequence -ContentBytes $reqBodyContent
-					$reqBodySection = ,([byte]0xA4) + (Write-ASN1Length $reqBodySeq.Length) + $reqBodySeq
-
-					# pvno [1]
-					$pvnoBytes     = Write-ASN1Integer -Value 5
-					$pvnoSection   = ,([byte]0xA1) + (Write-ASN1Length $pvnoBytes.Length) + $pvnoBytes
-
-					# msg-type [2]
-					$msgTypeBytes  = Write-ASN1Integer -Value 10  # AS-REQ
-					$msgTypeSection= ,([byte]0xA2) + (Write-ASN1Length $msgTypeBytes.Length) + $msgTypeBytes
-
-					# Combine KDC-REQ
-					$kdcReqContent  = $pvnoSection + $msgTypeSection + $reqBodySection
-					$kdcReqSeq      = Write-ASN1Sequence -ContentBytes $kdcReqContent
-
-					# APPLICATION [10] => 0x6A
-					$lengthBytes   = Write-ASN1Length $kdcReqSeq.Length
-					return ,([byte]0x6A) + $lengthBytes + $kdcReqSeq
-				}
-
-				if ([string]::IsNullOrEmpty($ClientName)) {
-					$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-					if ($currentUser -match '\\') {
-						$ClientName = $currentUser.Split('\')[1]
-					} else {
-						$ClientName = $currentUser
-					}
-					Write-Verbose "ClientName not specified; using current user: $ClientName"
-				}
-			}
-
-			process {
-				try {
-					# 1. Derive or validate Realm
-                    if ([string]::IsNullOrWhiteSpace($Realm)) {
-                        $labels = $Server.Split('.')
-                        switch ($labels.Count) {
-                            { $_ -ge 3 } {
-                                # Host plus at least two domain labels:
-                                # include every domain segment (subdomain, parent domain, tld)
-                                $Realm = ($labels[1..($labels.Count - 1)] -join '.').ToUpper()
-                                break
-                            }
-                            2 {
-                                # Only a two-label FQDN (e.g. domain.com)
-                                $Realm = ($labels -join '.').ToUpper()
-                                break
-                            }
-                            default {
-                                # Could not parse a domain
-                                $Realm = 'EXAMPLE.COM'
-                                Write-Warning "Could not derive realm from server name; using default '$Realm'."
-                            }
-                        }
-                    }
-
-
-					Write-Verbose "Testing Kerberos connectivity to $Server`:$Port (Realm: $Realm)"
-
-					# 2. Build AS-REQ packet
-					Write-Verbose "[1/5] Building AS-REQ packet..."
-					$asReqPacket = Build-KerberosASREQ -ClientName $ClientName -Realm $Realm
-
-					if ($PSBoundParameters.ContainsKey('Verbose') -and $asReqPacket) {
-						Write-Verbose "  AS-REQ packet size: $($asReqPacket.Length) bytes"
-						$toShow = if ($asReqPacket.Length -ge 32) { $asReqPacket[0..31] } else { $asReqPacket }
-						$hexDump = ($toShow | ForEach-Object { "{0:X2}" -f $_ }) -join ' '
-						Write-Verbose "  First bytes: $hexDump"
-					}
-
-					# 3. Resolve hostname
-					Write-Verbose "[2/5] Resolving hostname…"
-					try {
-						$dnsRecords = [System.Net.Dns]::GetHostAddresses($Server)
-						$ServerIP   = $dnsRecords | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
-						if (-not $ServerIP) {
-							throw "No IPv4 address found for '$Server'"
-						}
-						Write-Verbose "  Resolved to: $($ServerIP.IPAddressToString)"
-					}
-					catch {
-						Write-Error "DNS resolution failed: $($_.Exception.Message)"
-						return [PSCustomObject]@{
-							Success      = $false
-							Server       = $Server
-							Port         = $Port
-							Realm        = $Realm
-							ResponseTime = 0
-							ResponseSize = 0
-							Error        = "DNS_RESOLUTION_FAILED"
-							Details      = $_.Exception.Message
-						}
-					}
-
-					# 4. Send/Receive over UDP
-					Write-Verbose "[3/5] Sending AS-REQ packet..."
-					$udpClient = $null
-					$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-					try {
-						$udpClient = New-Object System.Net.Sockets.UdpClient
-						$udpClient.Client.ReceiveTimeout = $TimeoutMs
-						$remoteEP = [System.Net.IPEndPoint]::new($ServerIP, $Port)
-
-						$bytesSent = $udpClient.Send($asReqPacket, $asReqPacket.Length, $remoteEP)
-						if ($bytesSent -ne $asReqPacket.Length) {
-							Write-Warning "Only sent $bytesSent of $($asReqPacket.Length) bytes"
-						}
-						Write-Verbose "  Sent $bytesSent bytes to $($ServerIP):$Port"
-
-						# 5. Wait for response
-						Write-Verbose "[4/5] Waiting for response..."
-						try {
-							$receivedEP = $remoteEP
-							$response   = $udpClient.Receive([ref]$receivedEP)
-							$stopwatch.Stop()
-							Write-Verbose "  Received $($response.Length) bytes in $($stopwatch.ElapsedMilliseconds)ms"
-
-							# 6. Analyze response
-							Write-Verbose "[5/5] Analyzing response..."
-							$analysis = Analyze-KerberosResponse -ResponseBytes $response
-
-							$obj = [PSCustomObject]@{
-								Success       = $true
-								Server        = $Server
-								Port          = $Port
-								Realm         = $Realm
-								ResponseTime  = $stopwatch.ElapsedMilliseconds
-								ResponseSize  = $response.Length
-								Analysis      = $analysis
-								RawResponse   = if ($PSBoundParameters.ContainsKey('Verbose')) { $response } else { $null }
-							}
-							return $obj
-						}
-						catch [System.Net.Sockets.SocketException] {
-							$stopwatch.Stop()
-							$errCode = $_.Exception.SocketErrorCode
-							Write-Verbose "  SocketException: $errCode"
-
-							$errorMap = @{
-								'TimedOut'          = @{ Error='TIMEOUT'; Details="No response within $TimeoutMs ms" }
-								'ConnectionReset'   = @{ Error='PORT_CLOSED'; Details="ICMP Port Unreachable—likely closed" }
-								'NetworkUnreachable'= @{ Error='NETWORK_UNREACHABLE'; Details="Network is unreachable" }
-								'HostUnreachable'   = @{ Error='HOST_UNREACHABLE'; Details="Host is unreachable" }
-							}
-							$spec = if ($errorMap.ContainsKey($errCode.ToString())) {
-								$errorMap[$errCode.ToString()]
-							} else {  
-								@{ Error='SOCKET_ERROR'; Details="Socket error: $errCode" } 
-							}
-
-							return [PSCustomObject]@{
-								Success      = $false
-								Server       = $Server
-								Port         = $Port
-								Realm        = $Realm
-								ResponseTime = $stopwatch.ElapsedMilliseconds
-								ResponseSize = 0
-								Error        = $spec.Error
-								Details      = $spec.Details
-							}
-						}
-						catch {
-							$stopwatch.Stop()
-							Write-Error "Receive error: $($_.Exception.Message)"
-							return [PSCustomObject]@{
-								Success      = $false
-								Server       = $Server
-								Port         = $Port
-								Realm        = $Realm
-								ResponseTime = $stopwatch.ElapsedMilliseconds
-								ResponseSize = 0
-								Error        = "RECEIVE_FAILED"
-								Details      = $_.Exception.Message
-							}
-						}
-					}
-					catch {
-						Write-Error "Send failed: $($_.Exception.Message)"
-						return [PSCustomObject]@{
-							Success      = $false
-							Server       = $Server
-							Port         = $Port
-							Realm        = $Realm
-							ResponseTime = 0
-							ResponseSize = 0
-							Error        = "SEND_FAILED"
-							Details      = $_.Exception.Message
-						}
-					}
-					finally {
-						if ($udpClient) {
-							$udpClient.Close()
-							$udpClient.Dispose()
-						}
-					}
-				}
-				catch {
-					Write-Error "Unexpected error in Test-KerberosPort: $($_.Exception.Message)"
-					return [PSCustomObject]@{
-						Success      = $false
-						Server       = $Server
-						Port         = $Port
-						Realm        = $Realm
-						ResponseTime = 0
-						ResponseSize = 0
-						Error        = "UNEXPECTED_ERROR"
-						Details      = $_.Exception.Message
-					}
-				}
-			}
+		$detailsToDisplay = if ($PSBoundParameters.ContainsKey('Details')) { $Details } else { $message }
+		if ($detailsToDisplay) {
+			Write-Host (" " * 6) -NoNewline
+			Write-Host $detailsToDisplay -ForegroundColor Gray
 		}
-
-		Write-Verbose "Starting advanced Kerberos testing for Domain Controller: $DomainController"
-
-		# Initialize results object
-		$Results = [ordered]@{
-			DomainController     = $DomainController
-			ResolvedIPs          = @()
-			DnsResolutionError   = $null
-			UdpPort88Tested      = $false
-			UdpPort88Open        = $false
-			UdpPort88ResponseTime= $null
-			UdpPort88Analysis    = $null
-			UdpPort88Error       = $null
-			UdpPort88Details     = $null
-			TcpPort88Open        = $false
-			TcpPort389Open       = $false
-			TcpPort636Open       = $false
-			PortTestDetails      = @{}
-			TgtRequestStatus     = 'NotTested'
-			TgtRequestError      = $null
-			TgsRequestStatus     = 'NotTested'
-			TgsRequestError      = $null
-			SpnValidationStatus  = 'NotTested'
-			SpnValidationError   = $null
-			EncryptionType       = $null
-			TimeSkewSeconds      = $null
-			TimeSkewWarning      = $false
-			TimeSkewMessage      = $null
-			CrossRealmStatus     = 'NotTested'
-			CrossRealmErrors     = @()
-			OverallStatus        = 'InProgress'
-		}
-
-		# DNS Resolution Test
-		$dnsResult = Test-DnsResolution -DomainController $DomainController
-
-		if (-not $dnsResult.Success) {
-			$Results.DnsResolutionError = $dnsResult.ErrorMessage
-			$Results.OverallStatus = 'Failed'
-			return [PSCustomObject]$Results
-		}
-		$Results.ResolvedIPs = $dnsResult.ResolvedIPs
 	}
 
-	process {
-		# New: UDP Port 88 Test using Test-KerberosPort
-		Write-Verbose "Testing UDP port 88 connectivity"
-		$udpTestResult = Test-KerberosPort -Server $DomainController -Port 88 -TimeoutMs 5000
-		$Results.UdpPort88Tested = $true
-		if ($udpTestResult.Success -and $udpTestResult.Analysis.Type -in @('AS-REP', 'KRB-ERROR')) {
-			$Results.UdpPort88Open = $true
-			$Results.UdpPort88ResponseTime = $udpTestResult.ResponseTime
-			$Results.UdpPort88Analysis = $udpTestResult.Analysis
-		} else {
-			$Results.UdpPort88Open = $false
-			if ($udpTestResult.Success) {
-				$Results.UdpPort88Error = "Invalid Kerberos response"
-				$Results.UdpPort88Details = "Received response but not a valid Kerberos message"
-			} else {
-				$Results.UdpPort88Error = $udpTestResult.Error
-				$Results.UdpPort88Details = $udpTestResult.Details
-			}
+	# ---- MAIN ORCHESTRATOR LOGIC ----
+	$AllResults = [ordered]@{
+		'TestParameters' = @{
+			DomainController = $DomainController
+			UsingAlternateCredential = $PSBoundParameters.ContainsKey('Credential')
+			TestStartTime = Get-Date
 		}
+	}
+	$criticalError = $false
 
-		# TCP Connectivity Tests
-		$tcpResult = Test-TcpConnectivity -DomainController $DomainController -TimeoutSeconds $TimeoutSeconds
-		$Results.TcpPort88Open = $tcpResult.TcpPort88Open
-		$Results.TcpPort389Open = $tcpResult.TcpPort389Open
-		$Results.TcpPort636Open = $tcpResult.TcpPort636Open
-		$Results.PortTestDetails = $tcpResult.PortTestDetails
+	Write-Host "`n=== Comprehensive Kerberos Test for '$DomainController' ===" -ForegroundColor Cyan
+	Write-Host "`n--- Performing Pre-Flight Checks ---" -ForegroundColor Yellow
 
-		# TGT Request Test
-		$tgtResult = Test-TgtRequest -DomainController $DomainController -ParameterSetName $PSCmdlet.ParameterSetName -Credential $Credential
-		$Results.TgtRequestStatus = $tgtResult.TgtRequestStatus
-		$Results.TgtRequestError = $tgtResult.TgtRequestError
+	# 1. Session Check
+	$sessionResult = Test-KerberosSession
+	$AllResults.'KerberosSession' = $sessionResult
+	Write-TestStepResult -TestName "Client session supports Kerberos" -ResultObject $sessionResult -Details $sessionResult.Message
+	if (-not $sessionResult.Success) { $criticalError = $true }
 
-		# TGS and SPN Validation Tests
-		if ($Results.TgtRequestStatus -eq 'Success') {
-			$tgsResult = Test-TgsAndSpnValidation -DomainController $DomainController
-			$Results.TgsRequestStatus = $tgsResult.TgsRequestStatus
-			$Results.TgsRequestError = $tgsResult.TgsRequestError
-			$Results.SpnValidationStatus = $tgsResult.SpnValidationStatus
-			$Results.SpnValidationError = $tgsResult.SpnValidationError
-			$Results.EncryptionType = $tgsResult.EncryptionType
-		}
+	# 2. DNS Resolution
+	$dnsResult = Test-DnsResolution -DomainController $DomainController
+	$AllResults.'DnsResolution' = $dnsResult
+	$dnsDetails = if ($dnsResult.Success) { "Resolved IPs: $($dnsResult.ResolvedIPs -join ', ')" } else { $dnsResult.ErrorMessage }
+	Write-TestStepResult -TestName "DNS resolution for '$DomainController'" -ResultObject $dnsResult -Details $dnsDetails
+	if (-not $dnsResult.Success) { $criticalError = $true }
 
-		# Time Synchronization Test
+
+	# 3. TCP Connectivity
+	$tcpResult = $null
+	if (-not $criticalError) {
+		$tcpResult = Test-TcpConnectivity -DomainController $DomainController -Ports @(88, 389, 636)
+		$AllResults.'TcpConnectivity' = $tcpResult
+		if (-not $tcpResult.TcpPort88.Success -or -not $tcpResult.TcpPort389.Success) { $criticalError = $true }
+		Write-TestStepResult -TestName "TCP Port 88 (Kerberos)" -ResultObject $tcpResult.TcpPort88
+		Write-TestStepResult -TestName "TCP Port 389 (LDAP)" -ResultObject $tcpResult.TcpPort389
+		$ldapsStatus = if ($tcpResult.TcpPort636.Success) { 'PASS' } else { 'WARN' }
+		Write-TestStepResult -TestName "TCP Port 636 (LDAPS)" -ResultObject $tcpResult.TcpPort636 -StatusOverride $ldapsStatus -Details "Note: LDAPS is recommended but not required for Kerberos."
+	}
+	else { Write-Host "  - Skipping TCP Connectivity tests due to previous critical error." -ForegroundColor DarkGray }
+
+	# 4. Time Synchronization
+	$timeResult = $null
+	if (-not $criticalError) {
 		$timeResult = Test-TimeSynchronization -DomainController $DomainController
-		$Results.TimeSkewSeconds = $timeResult.TimeSkewSeconds
-		$Results.TimeSkewWarning = $timeResult.TimeSkewWarning
-		$Results.TimeSkewMessage = $timeResult.TimeSkewMessage
-
-		# Cross-Realm Referral Test
-		if ($TargetRealm) {
-			$crossRealmResult = Test-CrossRealmReferral -TargetRealm $TargetRealm -TgtRequestStatus $Results.TgtRequestStatus
-			$Results.CrossRealmStatus = $crossRealmResult.CrossRealmStatus
-			$Results.CrossRealmErrors = $crossRealmResult.CrossRealmErrors
-		}
-
-		# Determine Overall Status
-		$Results.OverallStatus = Get-OverallStatus -TestResults $Results
-
-		Write-Verbose "Overall test status: $($Results.OverallStatus)"
-
-		# Return Results
-		return [PSCustomObject]$Results
+		$AllResults.'TimeSynchronization' = $timeResult
+		$timeDetails = if ($timeResult.Success) { "Actual skew: $($timeResult.TimeSkewSeconds.ToString('F3')) seconds" } else { $timeResult.ErrorMessage }
+		Write-TestStepResult -TestName "Time skew is within 5 minutes" -ResultObject $timeResult -SuccessProperty 'IsSkewAcceptable' -Details $timeDetails
+		if (-not $timeResult.IsSkewAcceptable) { $criticalError = $true }
 	}
+	else { Write-Host "  - Skipping Time Synchronization test due to previous critical error." -ForegroundColor DarkGray }
+
+
+	if ($criticalError) {
+		Write-Error "Cannot proceed with authentication tests. Please resolve critical pre-flight errors."
+		$AllResults.OverallStatus = 'FAIL (Pre-Flight)'
+		return [PSCustomObject]$AllResults
+	}
+    
+	# 5. Fallback Authentication Audit
+	Write-Host "`n--- Performing Fallback Authentication Audit ---" -ForegroundColor Yellow
+	$altAuthParams = @{ DomainController = $DomainController }
+	if ($PSBoundParameters.ContainsKey('Credential')) { $altAuthParams.Credential = $Credential }
+	$altAuthResult = Test-AlternativeAuthentication @altAuthParams
+	$AllResults.'AlternativeAuth' = $altAuthResult
+	
+	# Create temporary result objects to pass to the formatter, determining PASS/WARN status
+	$anonResultObj = [pscustomobject]@{ Success = ($altAuthResult.AnonymousBindResult -ne 'Enabled (Insecure)'); ErrorMessage = $altAuthResult.AnonymousBindResult }
+	Write-TestStepResult -TestName "Anonymous LDAP bind is disabled" -ResultObject $anonResultObj -StatusOverride $(if ($anonResultObj.Success) {'PASS'} else {'WARN'}) -Details "Details: $($altAuthResult.AnonymousBindResult)"
+	
+	$ntlmResultObj = [pscustomobject]@{ Success = ($altAuthResult.NtlmBindResult -eq 'Success'); ErrorMessage = $altAuthResult.NtlmBindResult }
+	Write-TestStepResult -TestName "NTLM authentication" -ResultObject $ntlmResultObj -StatusOverride $( if ($ntlmResultObj.Success) {'PASS'} else {'WARN'}) -Details "Details: $($altAuthResult.NtlmBindResult) (Note: NTLM working is a good fallback, but Kerberos is preferred)"
+	
+	$basicResultObj = [pscustomobject]@{ Success = ($altAuthResult.BasicBindResult -ne 'Enabled (Insecure)'); ErrorMessage = $altAuthResult.BasicBindResult }
+	Write-TestStepResult -TestName "Basic LDAP bind is disabled/skipped" -ResultObject $basicResultObj -StatusOverride $(if ($basicResultObj.Success) {'PASS'} else {'WARN'}) -Details "Details: $($altAuthResult.BasicBindResult)"
+
+	Write-Host "`n--- Performing Deep Authentication Tests ---" -ForegroundColor Yellow
+
+	# 6. Low-Level KDC Check
+	$asReqResult = Invoke-KerberosAsRequest -Server $DomainController
+	$AllResults.'RawAsRequest' = $asReqResult
+	$asReqDetails = $asReqResult.ErrorDescription
+	if ($asReqResult.ErrorCode -eq 25) {
+		$asReqDetails += " - Note: This is an expected and healthy response for this test."
+	}
+	Write-TestStepResult -TestName "Low-level KDC check (UDP 88)" -ResultObject $asReqResult -SuccessProperty 'Operational' -Details $asReqDetails
+
+	# 7. High-Level Kerberos Bind (TGT/TGS)
+	$tgtResults = Test-TgtRequest @altAuthParams
+	$AllResults.'KerberosLdapBind' = $tgtResults
+	Write-Host "  • Kerberos LDAP bind security configurations:"
+	foreach ($res in $tgtResults) {
+		Write-TestStepResult -TestName "    - $($res.Configuration)" -ResultObject $res -Details $res.ErrorMessage
+	}
+
+	# 8. SPN Ticket Validation in Cache
+	$tgsParams = @{ DomainController = $DomainController }
+	if ($PurgeTicketCache) { $tgsParams.PurgeCache = $true }
+	$tgsResult = Test-TgsAndSpnValidation @tgsParams
+	$AllResults.'SpnTicketValidation' = $tgsResult
+	$tgsDetails = "Ticket Found: $($tgsResult.TicketFound), Encryption: $($tgsResult.EncryptionType)"
+	Write-TestStepResult -TestName "SPN ticket validation in cache" -ResultObject $tgsResult -Details $tgsDetails
+    
+    # 9. PAC Validation
+	$pacParams = @{ DomainController = $DomainController; IncludeTicketInfo = $true}
+	if ($PurgeTicketCache) { $pacParams.PurgeCache = $true }
+	$pacResult = Test-KerberosPacValidation @pacParams 
+	$AllResults.'PacValidation' = $pacResult
+	Write-TestStepResult -TestName "PAC validation via file share access" -ResultObject $pacResult -Details $pacResult.Message
+
+	# --- NEW: Final Summary Section ---
+	Write-Host "`n`n=== TEST SUMMARY ===" -ForegroundColor Cyan
+	
+	# Aggregate results for summary counts
+	$summaryCounters = @{ Pass = 0; Fail = 0; Warn = 0 }
+	$failedTestDetails = [System.Collections.ArrayList]::new()
+
+	if ($sessionResult.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Kerberos Session Support") }
+	if ($dnsResult.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("DNS Resolution") }
+	if ($tcpResult.TcpPort88.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("TCP Port 88") }
+	if ($tcpResult.TcpPort389.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("TCP Port 389") }
+	if ($tcpResult.TcpPort636.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Warn++ }
+	if ($timeResult.IsSkewAcceptable) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Time Synchronization") }
+	if ($asReqResult.Operational) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Low-level KDC Check") }
+	if ($altAuthResult.AnonymousBindResult -ne 'Enabled (Insecure)') { $summaryCounters.Pass++ } else { $summaryCounters.Warn++ }
+	if ($altAuthResult.BasicBindResult -ne 'Enabled (Insecure)') { $summaryCounters.Pass++ } else { $summaryCounters.Warn++ }
+	if ($altAuthResult.NtlmBindResult -eq 'Success') { $summaryCounters.Pass++ } else { $summaryCounters.Warn++ }
+	foreach ($res in $tgtResults) { if ($res.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Kerberos LDAP Bind: $($res.Configuration)") } }
+	if ($tgsResult.Success) { $summaryCounters.Pass++ } else { if($tgsResult.ErrorMessage -notmatch 'skipped'){ $summaryCounters.Fail++; [void]$failedTestDetails.Add("SPN Ticket Validation") } }
+    if ($pacResult.Success) { $summaryCounters.Pass++ } else { if($pacResult.Message -notmatch 'skipped'){ $summaryCounters.Fail++; [void]$failedTestDetails.Add("PAC Validation") } }
+
+	# Display counts
+	Write-Host (" " * 2 + "Tests Passed:   " + $summaryCounters.Pass) -ForegroundColor Green
+	Write-Host (" " * 2 + "Tests w/Warning:" + $summaryCounters.Warn) -ForegroundColor Yellow
+	Write-Host (" " * 2 + "Tests Failed:   " + $summaryCounters.Fail) -ForegroundColor Red
+	
+	# Determine and display overall status
+	$overallStatus = 'SUCCESS'
+	$overallColor = 'Green'
+	if ($summaryCounters.Fail -gt 0) {
+		$overallStatus = 'FAILURE'
+		$overallColor = 'Red'
+	}
+	elseif ($summaryCounters.Warn -gt 0) {
+		$overallStatus = 'SUCCESS WITH WARNINGS'
+		$overallColor = 'Yellow'
+	}
+	Write-Host "`nOverall Status: " -NoNewline
+	Write-Host $overallStatus -ForegroundColor $overallColor
+
+	# List critical issues and recommendations
+	if ($failedTestDetails.Count -gt 0) {
+		Write-Host "`nCRITICAL ISSUES:" -ForegroundColor Red
+		$failedTestDetails | ForEach-Object { Write-Host ("  - $_") }
+	}
+
+	$recommendations = [System.Collections.ArrayList]::new()
+	if ($altAuthResult.AnonymousBindResult -match 'Enabled') { [void]$recommendations.Add("Anonymous LDAP binding is enabled. For better security, this should be disabled on domain controllers.") }
+	if ($altAuthResult.BasicBindResult -match 'Enabled') { [void]$recommendations.Add("Basic LDAP authentication is enabled. This sends credentials in a weakly protected format and should be disabled.") }
+	if ($summaryCounters.Warn -gt 0) { [void]$recommendations.Add("Review items with a [WARN] status for potential security or configuration improvements.") }
+	if ($recommendations.Count -gt 0) {
+		Write-Host "`nRECOMMENDATIONS:" -ForegroundColor Yellow
+		$recommendations | ForEach-Object { Write-Host ("  - $_") }
+	}
+
+	$AllResults.Summary = @{
+		OverallStatus = $overallStatus
+		PassedCount = $summaryCounters.Pass
+		WarningCount = $summaryCounters.Warn
+		FailedCount = $summaryCounters.Fail
+		FailedTests = $failedTestDetails
+		Recommendations = $recommendations
+	}
+	
+	return [PSCustomObject]$AllResults
 }
