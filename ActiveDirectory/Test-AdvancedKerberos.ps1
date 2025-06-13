@@ -2962,6 +2962,7 @@ function Test-AdvancedKerberos {
 	if ($altAuthResult.NtlmBindResult -eq 'Success') { $summaryCounters.Pass++ } else { $summaryCounters.Warn++ }
 	foreach ($res in $tgtResults) { if ($res.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Kerberos LDAP Bind: $($res.Configuration)") } }
 	if ($tgsResult.Success) { $summaryCounters.Pass++ } else { if($tgsResult.ErrorMessage -notmatch 'skipped'){ $summaryCounters.Fail++; [void]$failedTestDetails.Add("SPN Ticket Validation") } }
+    if ($cipherResult.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Cipher Suite Compatibility (No common AES cipher)")}
     if ($pacResult.Success) { $summaryCounters.Pass++ } else { if($pacResult.Message -notmatch 'skipped'){ $summaryCounters.Fail++; [void]$failedTestDetails.Add("PAC Validation") } }
 
 	# Display counts
@@ -3009,3 +3010,5 @@ function Test-AdvancedKerberos {
 	
 	return [PSCustomObject]$AllResults
 }
+
+$data = Test-AdvancedKerberos -DomainController "MS01ADCCP05.schools.gcps1.gwin"
