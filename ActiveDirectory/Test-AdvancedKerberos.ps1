@@ -4,7 +4,7 @@
 # This script contains a suite of functions for diagnosing and testing
 # Kerberos authentication from a client's perspective.
 #
-# To execute, load the script into memory and then call:
+# To execute, run:
 # Test-AdvancedKerberos -DomainController "your-dc.your-domain.com"
 # =======================================================================
 
@@ -89,15 +89,14 @@ function New-Asn1Sequence {
 }
 
 function New-Asn1SequenceOf {
-	param(
-		[Parameter(Mandatory)]
-		[byte[][]]$Elements
-	)
-	$aggregate = @()
-	$aggregate = foreach ($el in $Elements) {
-        $el
-	}
-	return New-Asn1Sequence -ContentBytes $aggregate
+	[CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [byte[][]]$Elements
+    )
+
+    $contentBytes = foreach ($el in $Elements) { $el }
+    return New-Asn1Sequence -ContentBytes $contentBytes
 }
 
 function New-KerberosPrincipalArray {
@@ -141,18 +140,24 @@ function New-KerberosAsReqPacket {
 		[Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
 		[string]$ClientName,
+
 		[Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
 		[string]$Realm,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [int]$Nonce,
+
 		[string]$ServerName = $null,
+
 		[DateTime]$TillTime,
+
 		[int[]]$EncryptionTypes = @(18, 17, 23)
 	)
 	if ([string]::IsNullOrWhiteSpace($ServerName)) {
 		$ServerName = "krbtgt/$Realm"
 	}
-
-	[int]$Nonce = (Get-Random)
 
 	$zeroBytes = [byte[]](0, 0, 0, 0)
 	$kdcOptionsBytes = New-Asn1BitString -Bits $zeroBytes
@@ -225,6 +230,7 @@ function ConvertFrom-Asn1 {
 					17 { 'SET' }
 					18 { 'GeneralString' }
 					24 { 'GeneralizedTime' }
+					27 { 'GeneralString' }  # Added for KerberosString
 					default { "Universal[$tagNumber]" }
 				}
 			}
@@ -302,7 +308,203 @@ function Find-Asn1NodeByTagPath {
 		$currentNode = $foundChild
 	}
 	return $currentNode
-}        
+}
+
+function Find-PaDataByType {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Node,
+        [Parameter(Mandatory)]
+        [int]$PaType
+    )
+
+    Write-Verbose "Looking for PA-DATA type $PaType in node: $($Node.TagName)"
+    
+    # Check if Node has Value property and it's iterable
+    if (-not $Node.Value -or -not ($Node.Value -is [System.Collections.ArrayList])) {
+        Write-Verbose "Node.Value is not a valid collection"
+        return $null
+    }
+
+    Write-Verbose "Node has $($Node.Value.Count) children"
+    
+    foreach ($i in 0..($Node.Value.Count - 1)) {
+        $child = $Node.Value[$i]
+        Write-Verbose "Checking child $i`: $($child.TagName) (0x$($child.Tag.ToString('X2')))"
+        
+        # Each child should be a PA-DATA SEQUENCE
+        if (-not $child.Value -or -not ($child.Value -is [System.Collections.ArrayList])) {
+            Write-Verbose "  Child $i has no valid children"
+            continue
+        }
+
+        Write-Verbose "  Child $i has $($child.Value.Count) grandchildren"
+        
+        # Look for padata-type [1] INTEGER
+        foreach ($j in 0..($child.Value.Count - 1)) {
+            $grandchild = $child.Value[$j]
+            Write-Verbose "    Grandchild $j`: $($grandchild.TagName) (0x$($grandchild.Tag.ToString('X2')))"
+            
+            if ($grandchild.Tag -eq 0xA1) { # [1] padata-type
+                # Look for INTEGER inside the context tag
+                if ($grandchild.Value -and ($grandchild.Value -is [System.Collections.ArrayList])) {
+                    $intNode = $grandchild.Value | Where-Object { $_.Tag -eq 0x02 }
+                    if ($intNode) {
+                        $foundType = [int]$intNode.Value
+                        Write-Verbose "      Found padata-type: $foundType"
+                        
+                        if ($foundType -eq $PaType) {
+                            Write-Verbose "Found PA-DATA with type $PaType"
+                            return $child
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Write-Verbose "PA-DATA with type $PaType not found"
+    return $null
+}
+
+function Get-EtypeInfo2FromError {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [byte[]]$EDataBytes
+    )
+
+    try {
+        Write-Verbose "Parsing e-data ($($EDataBytes.Length) bytes) to unwrap the OCTET STRING..."
+        $eDataWrapperNode = ConvertFrom-Asn1 -Data $EDataBytes
+
+        if ($eDataWrapperNode.Tag -ne 0x04) {
+            Write-Warning "Expected e-data to be an OCTET STRING, but found $($eDataWrapperNode.TagName). Attempting to parse directly."
+            $parsedEData = $eDataWrapperNode
+        } else {
+            Write-Verbose "Successfully unwrapped OCTET STRING. Now parsing the inner PA-DATA sequence..."
+            $parsedEData = ConvertFrom-Asn1 -Data $eDataWrapperNode.RawValueBytes
+        }
+        
+        Write-Verbose "=== Inner E-DATA (PA-DATA Sequence) STRUCTURE ==="
+        Debug-Asn1Structure -Node $parsedEData -MaxDepth 5
+        Write-Verbose "==============================================="
+        
+        $etypeInfoNode = Find-PaDataByType -Node $parsedEData -PaType 19
+        if (-not $etypeInfoNode) {
+            Write-Verbose "Did not find PA-DATA type 19 (ETYPE-INFO2), looking for type 11 (ETYPE-INFO)..."
+            $etypeInfoNode = Find-PaDataByType -Node $parsedEData -PaType 11
+        }
+
+        if (-not $etypeInfoNode) {
+            Write-Verbose "No ETYPE-INFO or ETYPE-INFO2 found in e-data."
+            return @()
+        }
+
+        # The PA-DATA structure has two children: padata-type [1] and padata-value [2].
+        # We need the padata-value [2] node.
+        $paDataValueNode = $etypeInfoNode.Value | Where-Object { $_.Tag -eq 0xA2 } | Select-Object -First 1
+        
+        if (-not $paDataValueNode -or -not ($paDataValueNode.Value -is [System.Collections.ArrayList]) -or $paDataValueNode.Value.Count -eq 0) {
+            Write-Verbose "Found ETYPE-INFO node but it contains no padata-value."
+            return @()
+        }
+        
+        # *** START: The new critical fix ***
+        # The padata-value [2] contains an OCTET STRING. We must unwrap it.
+        $innerOctetStringNode = $paDataValueNode.Value[0]
+        if ($innerOctetStringNode.Tag -ne 0x04) {
+            Write-Warning "Expected inner value of PA-DATA to be an OCTET STRING, but it was not."
+            return @()
+        }
+
+        Write-Verbose "Unwrapping final OCTET STRING to get the ETYPE-INFO2 sequence."
+        # Parse the bytes *inside* the final OCTET STRING to get the list of encryption types.
+        $etypeInfoSequence = ConvertFrom-Asn1 -Data $innerOctetStringNode.RawValueBytes
+        # *** END: The new critical fix ***
+        
+        $etypeIds = @()
+        if ($etypeInfoSequence.Value -is [System.Collections.ArrayList]) {
+            # Iterate over each ETYPE-INFO2-ENTRY in the sequence
+            foreach ($entry in $etypeInfoSequence.Value) {
+                if ($entry.Value -is [System.Collections.ArrayList]) {
+                    # Find the etype [0] INTEGER
+                    $etypeTagNode = $entry.Value | Where-Object { $_.Tag -eq 0xA0 } | Select-Object -First 1
+                    if ($etypeTagNode -and $etypeTagNode.Value -is [System.Collections.ArrayList]) {
+                        $intNode = $etypeTagNode.Value | Where-Object { $_.Tag -eq 0x02 } | Select-Object -First 1
+                        if ($intNode) {
+                            $etypeId = [int]$intNode.Value
+                            $etypeIds += $etypeId
+                            Write-Verbose "Found supported encryption type ID: $etypeId"
+                        }
+                    }
+                }
+            }
+        }
+        
+        Write-Verbose "Extracted $($etypeIds.Count) encryption types: $($etypeIds -join ', ')"
+        return $etypeIds
+    }
+    catch {
+        Write-Verbose "Error parsing ETYPE-INFO: $($_.Exception.Message) at $($_.ScriptStackTrace)"
+        return @()
+    }
+} 
+
+function Get-EncryptionTypeMap {
+    return @{
+        1  = 'DES-CBC-CRC'
+        3  = 'DES-CBC-MD5'
+        17 = 'AES128-CTS-HMAC-SHA1-96'
+        18 = 'AES256-CTS-HMAC-SHA1-96'
+        19 = 'AES128-CTS-HMAC-SHA256-128'
+        20 = 'AES256-CTS-HMAC-SHA384-192'
+        23 = 'RC4-HMAC'
+        24 = 'RC4-HMAC-EXP'
+    }
+}
+
+function Convert-EncryptionType {
+    [CmdletBinding(DefaultParameterSetName = 'IdToName')]
+    param(
+        # ---------- ID ➔ Name ----------
+        [Parameter(Mandatory,
+                   ParameterSetName = 'IdToName',
+                   Position = 0)]
+        [ValidateScript({
+            if (-not (Get-EncryptionTypeMap).ContainsKey($_)) {
+                throw "Unsupported encryption-type ID: $_"
+            }
+            $true
+        })]
+        [int]$EtypeId,
+
+        # ---------- Name ➔ ID ----------
+        [Parameter(Mandatory,
+                   ParameterSetName = 'NameToId',
+                   Position = 0)]
+        [ValidateScript({
+            if (-not ((Get-EncryptionTypeMap).Values -contains $_)) {
+                throw "Unsupported encryption-type name: '$_'"
+            }
+            $true
+        })]
+        [string]$EtypeName
+    )
+
+    $map = Get-EncryptionTypeMap
+
+    switch ($PSCmdlet.ParameterSetName) {
+        'IdToName' { return $map[$EtypeId] }
+
+        'NameToId' {
+            return ($map.GetEnumerator() |
+                    Where-Object { $_.Value -ieq $EtypeName } |
+                    Select-Object -First 1 -ExpandProperty Key)
+        }
+    }
+}
 
 function Get-KerberosErrorDescription {
 	param([int]$ErrorCode)
@@ -314,6 +516,7 @@ function Get-KerberosErrorDescription {
 		7 = "KDC_ERR_S_PRINCIPAL_UNKNOWN - Server not found"
 		8 = "KDC_ERR_PRINCIPAL_NOT_UNIQUE - Multiple entries"
 		12 = "KDC_ERR_NEVER_VALID - Ticket not yet valid"
+		14 = "KDC_ERR_ETYPE_NOSUPP - Encryption type not supported"
 		18 = "KDC_ERR_CLIENT_REVOKED"
 		23 = "KDC_ERR_KEY_EXPIRED"
 		24 = "KDC_ERR_PREAUTH_FAILED"
@@ -331,32 +534,105 @@ function Get-KerberosErrorDescription {
 }
 
 function Get-KerberosResponseAnalysis {
-	param([byte[]]$ResponseBytes)
-	$analysis = [pscustomobject]@{ Type = 'UNKNOWN'; IsSuccess = $false; ErrorCode = $null; ErrorDescription = 'Response was not a valid AS-REP or KRB-ERROR.' }
-	if (-not $ResponseBytes -or $ResponseBytes.Length -lt 2) {
-		$analysis.Type = 'EMPTY_RESPONSE'
-		$analysis.ErrorDescription = 'No response data received from KDC.'
-		return $analysis
-	}
-	$parsedResponse = ConvertFrom-Asn1 -Data $ResponseBytes
-	switch ($parsedResponse.Tag) {
-		0x6B {
-			$analysis.Type = 'AS-REP'
-			$analysis.IsSuccess = $true
-			$analysis.ErrorDescription = 'Authentication successful (AS-REP received).'
-		}
-		0x7E {
-			$analysis.Type = 'KRB-ERROR'
-			$errorCodeNode = Find-Asn1NodeByTagPath -Node $parsedResponse -TagPath @(0x30, 0xA6, 0x02)
-			$errorCode = if ($errorCodeNode) { [int]$errorCodeNode.Value } else { $null }
-			$analysis.ErrorCode = $errorCode
-			$analysis.ErrorDescription = Get-KerberosErrorDescription $errorCode
-			if ($errorCode -eq 25) {
-				$analysis.IsSuccess = $true
-			}
-		}
-	}
-	return $analysis
+    param([byte[]]$ResponseBytes)
+
+    $analysis = [pscustomobject]@{
+        Type                       = 'UNKNOWN'
+        IsSuccess                  = $false
+        ErrorCode                  = $null
+        ErrorDescription           = 'Response was not a valid AS-REP or KRB-ERROR.'
+        SupportedEncryptionIds     = @()
+        SupportedEncryptionNames   = @()
+    }
+
+    if (-not $ResponseBytes -or $ResponseBytes.Length -lt 2) {
+        $analysis.Type             = 'EMPTY_RESPONSE'
+        $analysis.ErrorDescription = 'No response data received from KDC.'
+        return $analysis
+    }
+
+    try {
+        $parsedResponse = ConvertFrom-Asn1 -Data $ResponseBytes
+
+        switch ($parsedResponse.Tag) {
+            0x6B {   # AS-REP
+                $analysis.Type        = 'AS-REP'
+                $analysis.IsSuccess   = $true
+                $analysis.ErrorDescription = 'Authentication successful (AS-REP received).'
+            }
+
+            0x7E {   # KRB-ERROR
+                $analysis.Type = 'KRB-ERROR'
+
+                # Find error-code: KRB-ERROR SEQUENCE -> [6] error-code INTEGER
+                $errNode = Find-Asn1NodeByTagPath -Node $parsedResponse -TagPath @(0x30, 0xA6, 0x02)
+                $errCode = if ($errNode) { [int]$errNode.Value } else { $null }
+
+                $analysis.ErrorCode        = $errCode
+                $analysis.ErrorDescription = Get-KerberosErrorDescription $errCode
+
+                # Look for e-data field [12] which contains PA-DATA
+                if ($errCode -eq 25) {  # KDC_ERR_PREAUTH_REQUIRED
+                    $eDataNode = Find-Asn1NodeByTagPath -Node $parsedResponse -TagPath @(0x30, 0xAC)
+                    
+                    if ($eDataNode) {
+                        Write-Verbose "Found e-data field, extracting encryption types..."
+                        $etypeIds = Get-EtypeInfo2FromError -EDataBytes $eDataNode.RawValueBytes
+                        $analysis.SupportedEncryptionIds = $etypeIds
+                        $analysis.SupportedEncryptionNames = $etypeIds | ForEach-Object { 
+                            try { Convert-EncryptionType -EtypeId $_ } 
+                            catch { "Unknown($_ )" }
+                        }
+                    }
+                }
+                elseif ($errCode -eq 0) {
+                    $analysis.IsSuccess = $true
+                }
+            }
+        }
+    }
+    catch {
+        $analysis.ErrorDescription = "Failed to parse KDC response: $($_.Exception.Message)"
+        Write-Verbose "Response parsing error: $($_.Exception.Message)"
+    }
+
+    return $analysis
+}
+
+function Debug-Asn1Structure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Node,
+        [int]$Depth = 0,
+        [int]$MaxDepth = 10
+    )
+    
+    if ($Depth -gt $MaxDepth) {
+        Write-Verbose ("  " * $Depth) + "... (max depth reached)"
+        return
+    }
+    
+    $indent = "  " * $Depth
+    $tagHex = "0x{0:X2}" -f $Node.Tag
+    
+    Write-Verbose "$indent$($Node.TagName) ($tagHex) - Length: $($Node.Length)"
+    
+    if ($Node.Value -is [System.Collections.ArrayList]) {
+        Write-Verbose "$indent  Children: $($Node.Value.Count)"
+        foreach ($child in $Node.Value) {
+            Debug-Asn1Structure -Node $child -Depth ($Depth + 1) -MaxDepth $MaxDepth
+        }
+    } else {
+        $valueStr = if ($Node.Value -is [string]) { 
+            $Node.Value 
+        } elseif ($Node.Value -is [System.Numerics.BigInteger]) { 
+            $Node.Value.ToString() 
+        } else { 
+            $Node.Value.ToString() 
+        }
+        Write-Verbose "$indent  Value: $valueStr"
+    }
 }
 
 #-----------------------------------------------------------------------
@@ -1415,16 +1691,20 @@ function Test-TcpConnectivity {
 function Invoke-KerberosAsRequest {
 	<#
 	.SYNOPSIS
-		Invokes a Kerberos AS-REQ to test KDC reachability and basic functionality.
+		Invokes a Kerberos AS-REQ to test KDC reachability and discover supported encryption types.
 
 	.DESCRIPTION
         Builds a minimal ASN.1-encoded KERBEROS_AS_REQ packet and sends it over UDP to the specified KDC.
-        It then uses a robust, recursive ASN.1 parser to analyze the response (AS-REP or KRB-ERROR)
-        to reliably determine if the KDC is functioning correctly. A KRB-ERROR response with
-        "Pre-authentication required" (error 25) is considered a success for this test's purpose.
+        The function analyzes the KDC response to determine:
+        1. Basic connectivity and KDC health
+        2. Supported encryption types (extracted from ETYPE-INFO2 in error responses)
+        
+        When the KDC returns KDC_ERR_PREAUTH_REQUIRED, it includes ETYPE-INFO2 data that lists
+        all encryption types the KDC supports for the realm. This allows discovery of supported
+        encryption algorithms without requiring credentials.
 
 	.PARAMETER Server
-		FQDN or host name of the target KDC.
+		FQDN or hostname of the target KDC.
 
 	.PARAMETER Port
 		UDP port for Kerberos (default 88).
@@ -1433,198 +1713,236 @@ function Invoke-KerberosAsRequest {
 		Kerberos realm (e.g., CONTOSO.COM). If omitted, derived from the Server name.
 
 	.PARAMETER ClientName
-		Client principal name to use in the request. Defaults to the current user.
+		Client principal name to use in the request. Defaults to current user.
 
 	.PARAMETER TimeoutMs
-		Max milliseconds to wait for a UDP response (default 5000).
+		Maximum milliseconds to wait for UDP response (default 5000).
 
 	.PARAMETER TillTime
 		Ticket lifetime end time (defaults to 8 hours from now).
 
 	.PARAMETER Nonce
-		Request nonce (defaults to random value for better security).
+		Request nonce (defaults to random value).
+
+	.PARAMETER RequestedEncryptionTypes
+		Array of encryption type IDs to request. Defaults to common types.
 
 	.NOTES
-        This function combines ASN.1 encoder logic with a robust, recursive
-        ASN.1 parser to reliably interpret the KDC's response.
+        The function does not require credentials - it uses the KDC's preauth-required response
+        to discover supported encryption types. This is more reliable than attempting actual
+        authentication and works even with non-existent user accounts.
 
 	.EXAMPLE
 		Invoke-KerberosAsRequest -Server dc01.contoso.com -Verbose
+		
+		Tests KDC connectivity and discovers all supported encryption types.
+
+	.EXAMPLE
+		Invoke-KerberosAsRequest -Server dc01.contoso.com -ClientName testuser
+		
+		Tests with a specific client name (useful for testing with known accounts).
 
     .INPUTS
         System.String
     .OUTPUTS
-        PSCustomObject
+        PSCustomObject with KDC test results and supported encryption types
 	#>
 	[CmdletBinding()]
-	param(
-		[Parameter(Mandatory, Position = 0)]
-		[ValidateNotNullOrEmpty()]
-		[string]$Server,
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Server,
 
-		[ValidateRange(1, 65535)]
-		[int]$Port = 88,
+        [Parameter()]
+        [ValidateRange(1, 65535)]
+        [int]$Port = 88,
 
-		[ValidateNotNullOrEmpty()]
-		[string]$Realm = $null,
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$Realm = $null,
 
-		[Parameter()]
-		[string]$ClientName = $null,
+        [Parameter()]
+        [string]$ClientName = $null,
 
-		[ValidateRange(100, 60000)]
-		[int]$TimeoutMs = 5000,
+        [Parameter()]
+        [ValidateRange(100, 60000)]
+        [int]$TimeoutMs = 5000,
 
-		[DateTime]$TillTime = [DateTime]::Now.AddHours(8),
+        [Parameter()]
+        [DateTime]$TillTime = [DateTime]::Now.AddHours(8),
 
-		[int]$Nonce = (Get-Random -Minimum 100000000 -Maximum 999999999)
-	)
+        [Parameter()]
+        [int]$Nonce = (Get-Random -Minimum 1 -Maximum ([int]::MaxValue)),
 
-	begin {
-		if ([string]::IsNullOrEmpty($ClientName)) {
-			$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-			if ($currentUser -match '\\') {
-				$ClientName = $currentUser.Split('\')[1]
-			}
-			else {
-				$ClientName = $currentUser
-			}
-			Write-Verbose "ClientName not specified; using current user: $ClientName"
-		}
-	}
+        [Parameter()]
+        [ValidateSet('DES-CBC-CRC', 'DES-CBC-MD5', 'AES128-CTS-HMAC-SHA1-96', 'AES256-CTS-HMAC-SHA1-96', 'RC4-HMAC', 'AES128-CTS-HMAC-SHA256-128', 'AES256-CTS-HMAC-SHA384-192')]
+        [string[]]$RequestedEncryptionTypes = @('AES256-CTS-HMAC-SHA1-96', 'AES128-CTS-HMAC-SHA1-96', 'RC4-HMAC')
+    )
 
-	process {
-		try {
-			# Derive realm from server name if not provided
-			if ([string]::IsNullOrWhiteSpace($Realm)) {
-				$labels = $Server.Split('.')
-				switch ($labels.Count) {
-					{ $_ -ge 3 } {
-						$Realm = ($labels[1..($labels.Count - 1)] -join '.').ToUpper()
-						break
-					}
-					2 {
-						$Realm = ($labels -join '.').ToUpper()
-						break
-					}
-					default {
-						throw "Cannot derive realm from server name '$Server'. Please specify the -Realm parameter."
-					}
-				}
-				Write-Verbose "Derived realm from server name: $Realm"
-			}
+    begin {
+        # Set default client name if not provided
+        if ([string]::IsNullOrEmpty($ClientName)) {
+            $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            if ($currentUser -match '\\') {
+                $ClientName = $currentUser.Split('\')[1]
+            }
+            else {
+                $ClientName = $currentUser
+            }
+            Write-Verbose "ClientName not specified; using: $ClientName"
+        }
 
-			Write-Verbose "Testing Kerberos connectivity to $Server`:$Port (Realm: $Realm)"
-			Write-Verbose "Client: $ClientName, Nonce: $Nonce, TillTime: $($TillTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-			
-			Write-Verbose "[1/5] Building AS-REQ packet..."
-			$asReqPacket = New-KerberosAsReqPacket -ClientName $ClientName -Realm $Realm -TillTime $TillTime
-			Write-Verbose "  AS-REQ packet size: $($asReqPacket.Length) bytes"
+        # Convert string encryption types to integers
+        $requestedEncryptionTypeInts = foreach ($etypeStr in $RequestedEncryptionTypes) {
+            Convert-EncryptionType -EtypeName $etypeStr
+        }
+    }
 
-			Write-Verbose "[2/5] Resolving hostname..."
-			$ServerIP = $null
-			try {
-				$dnsRecords = [System.Net.Dns]::GetHostAddresses($Server)
-				$ServerIP = $dnsRecords | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
-				if (-not $ServerIP) {
-					throw "No IPv4 address found for '$Server'"
-				}
-				Write-Verbose "  Resolved to: $($ServerIP.IPAddressToString)"
-			}
-			catch {
-				throw "DNS resolution failed for '$Server': $($_.Exception.Message)"
-			}
+    process {
+        try {
+            # Derive realm from server name if not provided
+            if ([string]::IsNullOrWhiteSpace($Realm)) {
+                $labels = $Server.Split('.')
+                switch ($labels.Count) {
+                    { $_ -ge 3 } {
+                        $Realm = ($labels[1..($labels.Count - 1)] -join '.').ToUpper()
+                        break
+                    }
+                    2 {
+                        $Realm = ($labels -join '.').ToUpper()
+                        break
+                    }
+                    default {
+                        throw "Cannot derive realm from server name '$Server'. Please specify the -Realm parameter."
+                    }
+                }
+                Write-Verbose "Derived realm from server name: $Realm"
+            }
 
-			Write-Verbose "[3/5] Sending AS-REQ packet..."
-			$udpClient = $null
-			$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-			try {
-				$udpClient = New-Object System.Net.Sockets.UdpClient
-				$udpClient.Client.ReceiveTimeout = $TimeoutMs
-				$udpClient.Client.SendTimeout = $TimeoutMs
-				$remoteEP = [System.Net.IPEndPoint]::new($ServerIP, $Port)
-				
-				$bytesSent = $udpClient.Send($asReqPacket, $asReqPacket.Length, $remoteEP)
-				Write-Verbose "  Sent $bytesSent bytes"
+            Write-Verbose "Testing Kerberos KDC: $Server`:$Port (Realm: $Realm)"
+            Write-Verbose "Client: $ClientName, Nonce: $Nonce, TillTime: $($TillTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+            Write-Verbose "Requested Encryption Types: $($RequestedEncryptionTypes -join ', ')"
+            
+            Write-Verbose "[1/5] Building AS-REQ packet..."
+            $asReqPacket = New-KerberosAsReqPacket -ClientName $ClientName -Realm $Realm -TillTime $TillTime -EncryptionTypes $requestedEncryptionTypeInts -Nonce $Nonce
+            Write-Verbose "  AS-REQ packet size: $($asReqPacket.Length) bytes"
 
-				Write-Verbose "[4/5] Waiting for response (timeout: ${TimeoutMs}ms)..."
-				$receivedEP = $remoteEP
-				$response = $udpClient.Receive([ref]$receivedEP)
-				$stopwatch.Stop()
-				Write-Verbose "  Received $($response.Length) bytes in $($stopwatch.ElapsedMilliseconds)ms"
+            Write-Verbose "[2/5] Resolving hostname..."
+            $ServerIP = $null
+            try {
+                $dnsRecords = [System.Net.Dns]::GetHostAddresses($Server)
+                $ServerIP = $dnsRecords | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+                if (-not $ServerIP) {
+                    throw "No IPv4 address found for '$Server'"
+                }
+                Write-Verbose "  Resolved to: $($ServerIP.IPAddressToString)"
+            }
+            catch {
+                throw "DNS resolution failed for '$Server': $($_.Exception.Message)"
+            }
 
-				Write-Verbose "[5/5] Analyzing response..."
-				$analysis = Get-KerberosResponseAnalysis -ResponseBytes $response
-				
-				# Enhanced success determination
-				$isOperational = $analysis.IsSuccess -or 
-								($analysis.Type -eq 'KRB-ERROR' -and $analysis.ErrorCode -in @(6, 25)) # Client unknown or preauth required
-				
-				if ($analysis.Type -eq 'KRB-ERROR' -and $analysis.ErrorCode -eq 6) {
-					Write-Verbose "  KDC is operational (client principal unknown - expected for test)"
-				}
-				elseif ($analysis.IsSuccess) {
-					Write-Verbose "  KDC response indicates success: $($analysis.ErrorDescription)"
-				}
-				else {
-					Write-Verbose "  KDC error: $($analysis.ErrorDescription)"
-				}
+            Write-Verbose "[3/5] Sending AS-REQ packet..."
+            $udpClient = $null
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                $udpClient = New-Object System.Net.Sockets.UdpClient
+                $udpClient.Client.ReceiveTimeout = $TimeoutMs
+                $udpClient.Client.SendTimeout = $TimeoutMs
+                $remoteEP = [System.Net.IPEndPoint]::new($ServerIP, $Port)
+                
+                $bytesSent = $udpClient.Send($asReqPacket, $asReqPacket.Length, $remoteEP)
+                Write-Verbose "  Sent $bytesSent bytes"
 
-				$result = [PSCustomObject]@{
-					PSTypeName = 'KerberosAsRequestResult'
-					Success = $isOperational
-					Operational = $isOperational
-					Server = $Server
-					ServerIP = $ServerIP.IPAddressToString
-					Port = $Port
-					Realm = $Realm
-					ClientName = $ClientName
-					ResponseTime = $stopwatch.ElapsedMilliseconds
-					ResponseSize = $response.Length
-					ResponseType = $analysis.Type
-					ErrorCode = $analysis.ErrorCode
-					ErrorDescription = $analysis.ErrorDescription
-					Timestamp = [DateTime]::Now
-				}
-				
-				return $result
-			}
-			catch [System.Net.Sockets.SocketException] {
-				$stopwatch.Stop()
-				$errorMsg = switch ($_.Exception.SocketErrorCode) {
-					'TimedOut' { "Connection timed out after ${TimeoutMs}ms - KDC may be unreachable or not responding" }
-					'ConnectionRefused' { "Connection refused - KDC service may not be running on port $Port" }
-					'HostUnreachable' { "Host unreachable - network connectivity issue" }
-					'NetworkUnreachable' { "Network unreachable - routing issue" }
-					default { "Socket error: $($_.Exception.SocketErrorCode) - $($_.Exception.Message)" }
-				}
-				throw $errorMsg
-			}
-			finally {
-				if ($udpClient) {
-					$udpClient.Close()
-					$udpClient.Dispose()
-				}
-			}
-		}
-		catch {
-			return [PSCustomObject]@{
-				PSTypeName = 'KerberosAsRequestResult'
-				Success = $false
-				Operational = $false
-				Server = $Server
-				ServerIP = if ($ServerIP) { $ServerIP.IPAddressToString } else { $null }
-				Port = $Port
-				Realm = $Realm
-				ClientName = $ClientName
-				ResponseTime = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
-				ResponseSize = 0
-				ResponseType = 'ERROR'
-				ErrorCode = $null
-				ErrorDescription = $_.Exception.Message
-				Timestamp = [DateTime]::Now
-			}
-		}
-	}
+                Write-Verbose "[4/5] Waiting for response (timeout: ${TimeoutMs}ms)..."
+                $receivedEP = $remoteEP
+                $response = $udpClient.Receive([ref]$receivedEP)
+                $stopwatch.Stop()
+                Write-Verbose "  Received $($response.Length) bytes in $($stopwatch.ElapsedMilliseconds)ms"
+
+                Write-Verbose "[5/5] Analyzing response..."
+                $analysis = Get-KerberosResponseAnalysis -ResponseBytes $response
+                
+                # Determine if KDC is operational
+                $isOperational = $analysis.IsSuccess -or 
+                                ($analysis.Type -eq 'KRB-ERROR' -and $analysis.ErrorCode -in @(6, 25))
+                
+                if ($analysis.Type -eq 'KRB-ERROR' -and $analysis.ErrorCode -eq 6) {
+                    Write-Verbose "  KDC is operational (client principal unknown - expected)"
+                }
+                elseif ($analysis.Type -eq 'KRB-ERROR' -and $analysis.ErrorCode -eq 25) {
+                    Write-Verbose "  KDC is operational (pre-authentication required - expected)"
+                }
+                elseif ($analysis.IsSuccess) {
+                    Write-Verbose "  KDC response indicates success: $($analysis.ErrorDescription)"
+                }
+                else {
+                    Write-Verbose "  KDC error: $($analysis.ErrorDescription)"
+                }
+
+                $result = [PSCustomObject]@{
+                    PSTypeName                  = 'KerberosAsRequestResult'
+                    Success                     = $isOperational
+                    Operational                 = $isOperational
+                    Server                      = $Server
+                    ServerIP                    = $ServerIP.IPAddressToString
+                    Port                        = $Port
+                    Realm                       = $Realm
+                    ClientName                  = $ClientName
+                    RequestedEncryptionTypes    = $RequestedEncryptionTypes
+                    RequestedEncryptionTypeIds  = $requestedEncryptionTypeInts
+                    SupportedEncryptionIds      = $analysis.SupportedEncryptionIds
+                    SupportedEncryptionNames    = $analysis.SupportedEncryptionNames
+                    ResponseTime                = $stopwatch.ElapsedMilliseconds
+                    ResponseSize                = $response.Length
+                    ResponseType                = $analysis.Type
+                    ErrorCode                   = $analysis.ErrorCode
+                    ErrorDescription            = $analysis.ErrorDescription
+                    Timestamp                   = [DateTime]::Now
+                }
+                
+                return $result
+            }
+            catch [System.Net.Sockets.SocketException] {
+                $stopwatch.Stop()
+                $errorMsg = switch ($_.Exception.SocketErrorCode) {
+                    'TimedOut' { "Connection timed out after ${TimeoutMs}ms - KDC may be unreachable or not responding" }
+                    'ConnectionRefused' { "Connection refused - KDC service may not be running on port $Port" }
+                    'HostUnreachable' { "Host unreachable - network connectivity issue" }
+                    'NetworkUnreachable' { "Network unreachable - routing issue" }
+                    default { "Socket error: $($_.Exception.SocketErrorCode) - $($_.Exception.Message)" }
+                }
+                throw $errorMsg
+            }
+            finally {
+                if ($udpClient) {
+                    $udpClient.Close()
+                    $udpClient.Dispose()
+                }
+            }
+        }
+        catch {
+            return [PSCustomObject]@{
+                PSTypeName                  = 'KerberosAsRequestResult'
+                Success                     = $false
+                Operational                 = $false
+                Server                      = $Server
+                ServerIP                    = if ($ServerIP) { $ServerIP.IPAddressToString } else { $null }
+                Port                        = $Port
+                Realm                       = $Realm
+                ClientName                  = $ClientName
+                RequestedEncryptionTypes    = $RequestedEncryptionTypes
+                RequestedEncryptionTypeIds  = if ($requestedEncryptionTypeInts) { $requestedEncryptionTypeInts } else { @() }
+                SupportedEncryptionIds      = @()
+                SupportedEncryptionNames    = @()
+                ResponseTime                = if ($stopwatch) { $stopwatch.ElapsedMilliseconds } else { 0 }
+                ResponseSize                = 0
+                ResponseType                = 'ERROR'
+                ErrorCode                   = $null
+                ErrorDescription            = $_.Exception.Message
+                Timestamp                   = [DateTime]::Now
+            }
+        }
+    }
 }
 
 function Test-TimeSynchronization {
@@ -2334,6 +2652,101 @@ function Test-KerberosPacValidation {
     return $result
 }
 
+function Test-KerberosCipherSuite {
+    <#
+    .SYNOPSIS
+        Tests which Kerberos encryption ciphers are supported by a Domain Controller and the local client.
+    .DESCRIPTION
+        This function determines the intersection of supported Kerberos encryption types between the local
+        machine (client) and the remote KDC (server). It queries the server by sending an AS-REQ for
+        each known cipher and checks the client's configuration in the registry.
+    .PARAMETER DomainController
+        The FQDN of the Domain Controller (KDC) to test.
+    .OUTPUTS
+        PSCustomObject with detailed results about client, server, and common supported ciphers.
+    .EXAMPLE
+        Test-KerberosCipherSuite -DomainController "dc01.contoso.com"
+    .NOTES
+        This test is crucial for diagnosing "unsupported etype" errors. It depends on the
+        Get-EncryptionTypeMap and Invoke-KerberosAsRequest functions.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController
+    )
+
+    # Use the centralized helper function to get the definitive cipher map.
+    $cipherMap = Get-EncryptionTypeMap
+
+    # ---- 1. Test Server Supported Ciphers ----
+    Write-Verbose "Querying server '$DomainController' for supported ciphers..."
+    $serverSupported = [System.Collections.ArrayList]::new()
+    
+    # Iterate through the string names of the ciphers.
+    foreach ($cipherName in $cipherMap.Values) {
+        # Skip experimental or deprecated types we don't want to actively test.
+        if ($cipherName -like '*-EXP') { continue }
+
+        Write-Verbose "  - Testing for $cipherName..."
+        
+        # Call Invoke-KerberosAsRequest with the new string-based parameter.
+        $result = Invoke-KerberosAsRequest -Server $DomainController -RequestedEncryptionTypes @($cipherName)
+        
+        # 'Operational' is true if we get PREAUTH_REQUIRED, which means the KDC understood the etype.
+        # An explicit 'ETYPE_NOSUPP' error (14) is a definitive failure.
+        if ($result.Operational -and $result.ErrorCode -ne 14) {
+            [void]$serverSupported.Add($cipherName)
+            Write-Verbose "    ...Supported."
+        }
+        else {
+            Write-Verbose "    ...Not supported (Error: $($result.ErrorDescription))."
+        }
+    }
+
+    # ---- 2. Test Client Supported Ciphers ----
+    Write-Verbose "Querying local client for supported ciphers via registry..."
+    $clientSupported = [System.Collections.ArrayList]::new()
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters"
+    $regValue = Get-ItemProperty -Path $regPath -Name "SupportedEncryptionTypes" -ErrorAction SilentlyContinue
+
+    if ($regValue) {
+        $supportedBitmap = $regValue.SupportedEncryptionTypes
+        # Note: These bit flags correspond to the legacy mechanism for enabling/disabling etypes.
+        if (($supportedBitmap -band 0x1) -and $cipherMap.ContainsValue('DES-CBC-CRC')) { [void]$clientSupported.Add('DES-CBC-CRC') }
+        if (($supportedBitmap -band 0x2) -and $cipherMap.ContainsValue('DES-CBC-MD5')) { [void]$clientSupported.Add('DES-CBC-MD5') }
+        if (($supportedBitmap -band 0x4) -and $cipherMap.ContainsValue('RC4-HMAC')) { [void]$clientSupported.Add('RC4-HMAC') }
+        if (($supportedBitmap -band 0x8) -and $cipherMap.ContainsValue('AES128-CTS-HMAC-SHA1-96')) { [void]$clientSupported.Add('AES128-CTS-HMAC-SHA1-96') }
+        if (($supportedBitmap -band 0x10) -and $cipherMap.ContainsValue('AES256-CTS-HMAC-SHA1-96')) { [void]$clientSupported.Add('AES256-CTS-HMAC-SHA1-96') }
+        # Note: Newer SHA-2 types are generally enabled by default on modern OSes if not explicitly disabled.
+        # This check is a simplification for this function.
+    }
+    else {
+        # If the registry value is not set, Windows uses secure defaults.
+        Write-Verbose "Registry value 'SupportedEncryptionTypes' not found. Client is using OS defaults."
+        [void]$clientSupported.Add('RC4-HMAC')
+        [void]$clientSupported.Add('AES128-CTS-HMAC-SHA1-96')
+        [void]$clientSupported.Add('AES256-CTS-HMAC-SHA1-96')
+        [void]$clientSupported.Add('AES128-CTS-HMAC-SHA256-128')
+        [void]$clientSupported.Add('AES256-CTS-HMAC-SHA384-192')
+    }
+
+    # ---- 3. Analyze and Return Results ----
+    $commonCiphers = $serverSupported | Where-Object { $clientSupported.Contains($_) }
+    $isSecureOverlap = $commonCiphers | Where-Object { $_ -like 'AES*' }
+
+    return [PSCustomObject]@{
+        PSTypeName              = 'Kerberos.CipherSuiteResult'
+        Success                 = [bool]$isSecureOverlap
+        Message                 = if ([bool]$isSecureOverlap) { "Success: Client and Server share a secure (AES) cipher." } else { "Failure: No common AES cipher found." }
+        ClientSupportedCiphers  = $clientSupported.ToArray() | Sort-Object
+        ServerSupportedCiphers  = $serverSupported.ToArray() | Sort-Object
+        CommonCiphers           = $commonCiphers | Sort-Object
+        RecommendedAction       = if (-not [bool]$isSecureOverlap) { "Ensure both client and server have a common AES cipher suite enabled for Kerberos." } else { "None" }
+    }
+}
+
 
 #-----------------------------------------------------------------------
 # SECTION 3: Main Orchestrator Function
@@ -2355,7 +2768,13 @@ function Test-AdvancedKerberos {
 		Note: Some tests like ticket cache validation will be skipped when using alternate credentials.
 	.PARAMETER PurgeTicketCache
 		Optional switch to run 'klist purge' before TGS/SPN validation tests. Use with caution.
+    .NOTES
+		Name: Test-AdvancedKerberos
+		Author: Ryan Whitlock
+		Date: 06.06.2025
+		Version: 1.0
 	#>
+
 	[CmdletBinding(DefaultParameterSetName = 'CurrentUser')]
 	param(
 		[Parameter(Mandatory = $true)]
@@ -2511,8 +2930,13 @@ function Test-AdvancedKerberos {
 	$AllResults.'SpnTicketValidation' = $tgsResult
 	$tgsDetails = "Ticket Found: $($tgsResult.TicketFound), Encryption: $($tgsResult.EncryptionType)"
 	Write-TestStepResult -TestName "SPN ticket validation in cache" -ResultObject $tgsResult -Details $tgsDetails
+
+    # 9. Cipher Suite Compatibility
+	$cipherResult = Test-KerberosCipherSuite -DomainController $DomainController; $AllResults.'CipherSuite' = $cipherResult
+	$cipherDetails = "Common Ciphers: $($cipherResult.CommonCiphers -join ', ')"
+	Write-TestStepResult -TestName "Client and KDC share a secure cipher" -ResultObject $cipherResult -Details $cipherDetails
     
-    # 9. PAC Validation
+    # 10. PAC Validation
 	$pacParams = @{ DomainController = $DomainController; IncludeTicketInfo = $true}
 	if ($PurgeTicketCache) { $pacParams.PurgeCache = $true }
 	$pacResult = Test-KerberosPacValidation @pacParams 
