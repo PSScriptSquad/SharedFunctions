@@ -138,16 +138,16 @@ function New-KerberosAsReqPacket {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
+        	[ValidateNotNullOrEmpty()]
 		[string]$ClientName,
 
 		[Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
+        	[ValidateNotNullOrEmpty()]
 		[string]$Realm,
 
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [int]$Nonce,
+        	[Parameter(Mandatory)]
+        	[ValidateNotNullOrEmpty()]
+        	[int]$Nonce,
 
 		[string]$ServerName = $null,
 
@@ -2112,7 +2112,6 @@ function Test-AlternativeAuthentication {
     $result.AnonymousBindResult = if ($anonymousResult.Success) { 'Enabled (Insecure)' } else { 'Disabled (Secure)' }
     $result.AnonymousBindError = $anonymousResult.ErrorMessage
 
-
     # Test NTLM Authentication
     Write-Verbose "Testing NTLM authentication..."
     $ntlmConn = [System.DirectoryServices.Protocols.LdapConnection]::new($DomainController)
@@ -2126,7 +2125,6 @@ function Test-AlternativeAuthentication {
     $ntlmResult = Invoke-LdapBind -Connection $ntlmConn
     $result.NtlmBindResult = if ($ntlmResult.Success) { 'Success' } else { 'Failure' }
     $result.NtlmBindError = $ntlmResult.ErrorMessage
-
 
     # Test Basic Authentication (only if credentials provided)
     if ($Credential) {
@@ -2201,7 +2199,6 @@ function Test-KerberosSession {
 
 function Test-TgtRequest {
     <#
-     <#
     .SYNOPSIS
         Provides a detailed diagnostic test of Kerberos LDAP bind configurations.
     .DESCRIPTION
@@ -2855,7 +2852,6 @@ function Test-AdvancedKerberos {
 	Write-TestStepResult -TestName "DNS resolution for '$DomainController'" -ResultObject $dnsResult -Details $dnsDetails
 	if (-not $dnsResult.Success) { $criticalError = $true }
 
-
 	# 3. TCP Connectivity
 	$tcpResult = $null
 	if (-not $criticalError) {
@@ -2931,12 +2927,12 @@ function Test-AdvancedKerberos {
 	$tgsDetails = "Ticket Found: $($tgsResult.TicketFound), Encryption: $($tgsResult.EncryptionType)"
 	Write-TestStepResult -TestName "SPN ticket validation in cache" -ResultObject $tgsResult -Details $tgsDetails
 
-    # 9. Cipher Suite Compatibility
+    	# 9. Cipher Suite Compatibility
 	$cipherResult = Test-KerberosCipherSuite -DomainController $DomainController; $AllResults.'CipherSuite' = $cipherResult
 	$cipherDetails = "Common Ciphers: $($cipherResult.CommonCiphers -join ', ')"
 	Write-TestStepResult -TestName "Client and KDC share a secure cipher" -ResultObject $cipherResult -Details $cipherDetails
     
-    # 10. PAC Validation
+    	# 10. PAC Validation
 	$pacParams = @{ DomainController = $DomainController; IncludeTicketInfo = $true}
 	if ($PurgeTicketCache) { $pacParams.PurgeCache = $true }
 	$pacResult = Test-KerberosPacValidation @pacParams 
@@ -2962,8 +2958,8 @@ function Test-AdvancedKerberos {
 	if ($altAuthResult.NtlmBindResult -eq 'Success') { $summaryCounters.Pass++ } else { $summaryCounters.Warn++ }
 	foreach ($res in $tgtResults) { if ($res.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Kerberos LDAP Bind: $($res.Configuration)") } }
 	if ($tgsResult.Success) { $summaryCounters.Pass++ } else { if($tgsResult.ErrorMessage -notmatch 'skipped'){ $summaryCounters.Fail++; [void]$failedTestDetails.Add("SPN Ticket Validation") } }
-    if ($cipherResult.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Cipher Suite Compatibility (No common AES cipher)")}
-    if ($pacResult.Success) { $summaryCounters.Pass++ } else { if($pacResult.Message -notmatch 'skipped'){ $summaryCounters.Fail++; [void]$failedTestDetails.Add("PAC Validation") } }
+    	if ($cipherResult.Success) { $summaryCounters.Pass++ } else { $summaryCounters.Fail++; [void]$failedTestDetails.Add("Cipher Suite Compatibility (No common AES cipher)")}
+    	if ($pacResult.Success) { $summaryCounters.Pass++ } else { if($pacResult.Message -notmatch 'skipped'){ $summaryCounters.Fail++; [void]$failedTestDetails.Add("PAC Validation") } }
 
 	# Display counts
 	Write-Host (" " * 2 + "Tests Passed:   " + $summaryCounters.Pass) -ForegroundColor Green
@@ -3010,5 +3006,3 @@ function Test-AdvancedKerberos {
 	
 	return [PSCustomObject]$AllResults
 }
-
-$data = Test-AdvancedKerberos -DomainController "MS01ADCCP05.schools.gcps1.gwin"
