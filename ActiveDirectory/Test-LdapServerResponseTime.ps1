@@ -1,3 +1,32 @@
+function Test-TargetFileLock {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
+
+    $parentPath = Split-Path -Path $Path -Parent    
+    if ([string]::IsNullOrWhiteSpace($parentPath)) { $parentPath = ".\" }
+
+    if (-not (Test-Path -Path $parentPath)) {
+        throw "Path Error: The destination directory '$parentPath' does not exist."
+    }
+
+    if (Test-Path -Path $Path -PathType Leaf) {
+        try {
+            $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $stream.Close()
+            return $true
+        }
+        catch {
+            throw "File Lock Error: The file '$Path' is currently open in another program. Please close it."
+        }
+    }
+
+    return $true
+}
+
 function Test-LdapServerResponseTime {
     <#
     .SYNOPSIS
@@ -115,10 +144,12 @@ function Test-LdapServerResponseTime {
 
         [Parameter(Mandatory = $false)]
         [ValidateNotNullOrEmpty()]
+        [ValidateScript({ Test-TargetFileLock -Path $_ })]
         [string]$CsvPath,
 
         [Parameter(Mandatory = $false)]
         [ValidateNotNullOrEmpty()]
+        [ValidateScript({ Test-TargetFileLock -Path $_ })]
         [string]$CsvSummaryPath
     )
 
@@ -142,19 +173,20 @@ function Test-LdapServerResponseTime {
                 [Parameter(Mandatory = $true)]
                 [string]$ServerName
             )
-
+ 
             if (-not $serverColors.ContainsKey($ServerName)) {
-                $usedColors = $serverColors.Values
-                $unassigned = $availableColors | Where-Object { $usedColors -notcontains $_ }
-
+                $usedColors  = @($serverColors.Values)
+                $unassigned  = @($availableColors | Where-Object { $usedColors -notcontains $_ })
+ 
                 if ($unassigned.Count -gt 0) {
                     $serverColors[$ServerName] = $unassigned[(Get-Random -Minimum 0 -Maximum $unassigned.Count)]
                 }
                 else {
-                    $serverColors[$ServerName] = $availableColors[(Get-Random -Minimum 0 -Maximum $availableColors.Count)]
+                    # More servers than colors - cycle by assignment order
+                    $serverColors[$ServerName] = $availableColors[$serverColors.Count % $availableColors.Count]
                 }
             }
-
+ 
             return $serverColors[$ServerName]
         }
 
@@ -688,7 +720,7 @@ function Test-LdapServerResponseTime {
         $queue      = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
         $resultBag  = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
         $detailBag  = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
-        $runspaces  = @()
+        $runspaces = New-Object 'System.Collections.Generic.List[object]'
     }
 
     Process {
@@ -861,10 +893,10 @@ function Test-LdapServerResponseTime {
 
                 $pipe.RunspacePool = $runspacePool
 
-                $runspaces += [pscustomobject]@{
+                [void]$runspaces.Add([pscustomobject]@{
                     Pipe   = $pipe
                     Handle = $pipe.BeginInvoke()
-                }
+                })
             }
 
             while (($runspaces.Handle.IsCompleted -contains $false) -or (-not $queue.IsEmpty)) {
