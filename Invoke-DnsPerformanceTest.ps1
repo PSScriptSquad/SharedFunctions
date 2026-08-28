@@ -79,7 +79,8 @@ function Invoke-DnsPerformanceTest {
 
     .PARAMETER DegradationWindowSeconds
         Sliding window used by the final DNS latency degradation analysis. The default
-        is five seconds, evaluated once per second for each server-by-FQDN pair.
+        is five seconds, evaluated once per second for each server-by-FQDN pair after
+        a complete window has accumulated.
 
     .PARAMETER MinimumDegradationSamples
         Minimum violating queries required before a degradation objective can fail.
@@ -122,16 +123,24 @@ function Invoke-DnsPerformanceTest {
         either phase would exceed this value.
 
     .EXAMPLE
-        $result = Invoke-DnsPerformanceTest `
-            -FQDNs 'app1.contoso.com','app2.contoso.com','www.microsoft.com' `
-            -DNSServers 'dns01.contoso.com','dns02.contoso.com' `
-            -QueriesPerSecond 200 -DurationSeconds 120
+        $testParameters = @{
+            FQDNs = 'app1.contoso.com','app2.contoso.com','www.microsoft.com'
+            DNSServers = 'dns01.contoso.com','dns02.contoso.com'
+            QueriesPerSecond = 200
+            DurationSeconds = 120
+        }
+        $result = Invoke-DnsPerformanceTest @testParameters
 
     .EXAMPLE
-        $result = Invoke-DnsPerformanceTest `
-            -FQDNs $names -DNSServers $servers -QueriesPerSecond 200 `
-            -DurationSeconds 1800 -DisplayIntervalSeconds 5 `
-            -CsvOutputPath 'C:\Temp\DnsPerformance.csv'
+        $testParameters = @{
+            FQDNs = $names
+            DNSServers = $servers
+            QueriesPerSecond = 200
+            DurationSeconds = 1800
+            DisplayIntervalSeconds = 5
+            CsvOutputPath = 'C:\Temp\DnsPerformance.csv'
+        }
+        $result = Invoke-DnsPerformanceTest @testParameters
 
     .OUTPUTS
         PSCustomObject containing configuration, timing, cumulative metrics, status
@@ -141,7 +150,7 @@ function Invoke-DnsPerformanceTest {
 
     .NOTES
         Name: Invoke-DnsPerformanceTest
-        Version: 3.5.0
+        Version: 3.5.3
         PowerShell: Windows PowerShell 5.1 (including ISE) or PowerShell 7+
 
         This is a controlled production probe. Confirm that the requested aggregate
@@ -154,8 +163,11 @@ function Invoke-DnsPerformanceTest {
           * at least 99% of successful answers below 10 ms; and
           * at least 99.9% of successful answers below 50 ms.
 
-        A window must contain at least MinimumDegradationSamples violations of an
-        objective before it qualifies. The 10 ms and 50 ms grades are intentionally
+        Short-window evaluation begins only after a complete DegradationWindowSeconds
+        window has accumulated, preventing shorter startup denominators from being
+        more sensitive than later windows. A window must also contain at least
+        MinimumDegradationSamples violations of an objective before it qualifies.
+        The 10 ms and 50 ms grades are intentionally
         conservative relative to RFC 9199's observation that a cached response is
         typically below 1 ms and that 50 ms can be fast for a new query. They are
         service objectives for this controlled cached-answer test, not universal DNS
@@ -281,7 +293,7 @@ function Invoke-DnsPerformanceTest {
     )
 
     begin {
-        if (-not ('DnsPerformanceV350.DnsLoadRunner' -as [type])) {
+        if (-not ('DnsPerformanceV353.DnsLoadRunner' -as [type])) {
             Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
 using System;
 using System.Collections.Concurrent;
@@ -296,7 +308,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace DnsPerformanceV350
+namespace DnsPerformanceV353
 {
     public sealed class DnsTarget
     {
@@ -841,7 +853,7 @@ namespace DnsPerformanceV350
         public DateTime EndUtc { get; internal set; }
         public double DurationMs { get; internal set; }
         public string PrimaryScope { get; internal set; }
-        // Retained as an alias for callers of earlier versions. In v3.5.0 this
+        // Retained as an alias for callers of earlier versions. In v3.5.3 this
         // has the same independently qualifying-server meaning as PrimaryScope.
         public string Correlation { get; internal set; }
         // Retained as an exact-count compatibility string; use the numeric
@@ -1384,6 +1396,11 @@ namespace DnsPerformanceV350
                             int expired = i - window;
                             if (expired >= 0)
                                 AddCounts(GetBucket(s, n, expired), ref sent, ref success, ref availability, ref normal, ref severe, -1);
+
+                            // Use identically sized denominators throughout the run.
+                            // Partial startup windows would otherwise be more sensitive
+                            // than the configured complete sliding window.
+                            if (i < window - 1) continue;
 
                             bool availabilityBreach = IsBreach(availability, sent, 0.001);
                             bool normalBreach = IsBreach(normal, success, 0.01);
@@ -3113,7 +3130,7 @@ namespace DnsPerformanceV350
 
         function Convert-MetricSnapshot {
             param(
-                [Parameter(Mandatory)][DnsPerformanceV350.MetricSnapshot]$Metric,
+                [Parameter(Mandatory)][DnsPerformanceV353.MetricSnapshot]$Metric,
                 [string]$NameProperty,
                 [string]$Name,
                 [string]$Address,
@@ -3139,8 +3156,8 @@ namespace DnsPerformanceV350
 
         function Get-DashboardLines {
             param(
-                [Parameter(Mandatory)][DnsPerformanceV350.LiveSnapshot]$Snapshot,
-                [Parameter(Mandatory)][DnsPerformanceV350.RunnerProgress]$Progress,
+                [Parameter(Mandatory)][DnsPerformanceV353.LiveSnapshot]$Snapshot,
+                [Parameter(Mandatory)][DnsPerformanceV353.RunnerProgress]$Progress,
                 [Parameter(Mandatory)][string[]]$Names,
                 [Parameter(Mandatory)][int]$TargetAggregateQps,
                 [Parameter(Mandatory)][int]$PerServerQps,
@@ -3157,11 +3174,19 @@ namespace DnsPerformanceV350
                     [Math]::Max(0.0, ($now - $Progress.WarmupStartUtc).TotalSeconds)
                 }
                 return @(
-                    ('DNS PERFORMANCE TEST v3.5.0 - {0} - UTC {1:HH:mm:ss}' -f $phase, $now),
-                    ('{0} endpoints x {1} QPS/server = {2} target aggregate QPS | {3} names | measured {4}s | warm-up {5}s' -f `
-                        $EndpointCount, $PerServerQps, $TargetAggregateQps, $Names.Count, $Duration, $Progress.WarmupSeconds),
-                    ('Warm-up elapsed {0:0.0}/{1}s; measurements and CSV rows begin after warm-up.' -f `
-                        [Math]::Min($warmElapsed, [double]$Progress.WarmupSeconds), $Progress.WarmupSeconds)
+                    ('DNS PERFORMANCE TEST v3.5.3 - {0} - UTC {1:HH:mm:ss}' -f $phase, $now),
+                    ('{0} endpoints x {1} QPS/server = {2} target aggregate QPS | {3} names | measured {4}s | warm-up {5}s' -f @(
+                        $EndpointCount
+                        $PerServerQps
+                        $TargetAggregateQps
+                        $Names.Count
+                        $Duration
+                        $Progress.WarmupSeconds
+                    )),
+                    ('Warm-up elapsed {0:0.0}/{1}s; measurements and CSV rows begin after warm-up.' -f @(
+                        [Math]::Min($warmElapsed, [double]$Progress.WarmupSeconds)
+                        $Progress.WarmupSeconds
+                    ))
                 )
             }
             $elapsed = [Math]::Max(0.001, ($now - $Progress.StartUtc).TotalSeconds)
@@ -3175,19 +3200,37 @@ namespace DnsPerformanceV350
                 Format-MetricNumber $overall.Qps '0.0'
             }
             $lines = New-Object 'System.Collections.Generic.List[string]'
-            $lines.Add(('DNS PERFORMANCE TEST v3.5.0 - {0} - UTC {1:HH:mm:ss}' -f $phase, $now))
-            $lines.Add(('{0} endpoints x {1} QPS/server = {2} target aggregate QPS | {3} names | {4}s | {5:n0} planned | MaxOutstanding/server {6}' -f `
-                $EndpointCount, $PerServerQps, $TargetAggregateQps, $Names.Count, $Duration, $Planned, $OutstandingLimit))
-            $lines.Add(('Elapsed {0,7:0.0}/{1}s | Send QPS {2,8:0.0}/{3} | Rolling completion QPS {4,8} | Sent {5:n0} | Done {6:n0} | Drop {7:n0}' -f `
-                $scheduleElapsed, $Duration, $sendQps, $TargetAggregateQps, $rollingQpsText,
-                $Progress.StartedQueries, $Progress.CompletedQueries, $drop))
-            $lines.Add(('ROLLING SOCKET-OBSERVED LATENCY - all servers/FQDNs, successful responses only, last {0:0.0}s:' -f `
-                $Snapshot.EffectiveWindowSeconds))
-            $lines.Add(('AVG {0}  STD {1}  P50 {2}  P95 {3}  P99 {4}  MAX {5}' -f `
-                (Format-MetricNumber $overall.AverageMs),
-                (Format-MetricNumber $overall.StdDevMs), (Format-MetricNumber $overall.P50Ms),
-                (Format-MetricNumber $overall.P95Ms), (Format-MetricNumber $overall.P99Ms),
-                (Format-MetricNumber $overall.MaxMs)))
+            $lines.Add(('DNS PERFORMANCE TEST v3.5.3 - {0} - UTC {1:HH:mm:ss}' -f $phase, $now))
+            $lines.Add(('{0} endpoints x {1} QPS/server = {2} target aggregate QPS | {3} names | {4}s | {5:n0} planned | MaxOutstanding/server {6}' -f @(
+                $EndpointCount
+                $PerServerQps
+                $TargetAggregateQps
+                $Names.Count
+                $Duration
+                $Planned
+                $OutstandingLimit
+            )))
+            $lines.Add(('Elapsed {0,7:0.0}/{1}s | Send QPS {2,8:0.0}/{3} | Rolling completion QPS {4,8} | Sent {5:n0} | Done {6:n0} | Drop {7:n0}' -f @(
+                $scheduleElapsed
+                $Duration
+                $sendQps
+                $TargetAggregateQps
+                $rollingQpsText
+                $Progress.StartedQueries
+                $Progress.CompletedQueries
+                $drop
+            )))
+            $lines.Add(('ROLLING SOCKET-OBSERVED LATENCY - all servers/FQDNs, successful responses only, last {0:0.0}s:' -f @(
+                $Snapshot.EffectiveWindowSeconds
+            )))
+            $lines.Add(('AVG {0}  STD {1}  P50 {2}  P95 {3}  P99 {4}  MAX {5}' -f @(
+                (Format-MetricNumber $overall.AverageMs)
+                (Format-MetricNumber $overall.StdDevMs)
+                (Format-MetricNumber $overall.P50Ms)
+                (Format-MetricNumber $overall.P95Ms)
+                (Format-MetricNumber $overall.P99Ms)
+                (Format-MetricNumber $overall.MaxMs)
+            )))
             # Mandatory string-array parameters reject empty elements in Windows
             # PowerShell, so use a visible-width separator for the blank row.
             $lines.Add(' ')
@@ -3207,12 +3250,16 @@ namespace DnsPerformanceV350
                 $serverQpsText = if ($Snapshot.EffectiveWindowSeconds -lt 1.0) { '-' } else {
                     Format-MetricNumber $server.Metrics.Qps '0.0'
                 }
-                $row = ('{0,-18} {1,8} {2,7}' -f `
-                    (Format-FixedText (Get-ShortServerName $server.Server) 18),
-                    $serverQpsText,
-                    (Format-MetricNumber $server.Metrics.SuccessRatePercent '0.00'))
-                $row += (' | {0,7} {1,7} {2,7}' -f `
-                    $server.Metrics.Timeout, $server.Metrics.DnsError, $server.Metrics.OtherFailure)
+                $row = ('{0,-18} {1,8} {2,7}' -f @(
+                    (Format-FixedText (Get-ShortServerName $server.Server) 18)
+                    $serverQpsText
+                    (Format-MetricNumber $server.Metrics.SuccessRatePercent '0.00')
+                ))
+                $row += (' | {0,7} {1,7} {2,7}' -f @(
+                    $server.Metrics.Timeout
+                    $server.Metrics.DnsError
+                    $server.Metrics.OtherFailure
+                ))
                 for ($n = 0; $n -lt $Names.Count; $n++) {
                     $cell = $server.FqdnMetrics[$n]
                     $averageText = Format-MetricNumber $cell.AverageMs
@@ -3274,27 +3321,44 @@ namespace DnsPerformanceV350
             $resolvedNameWidth = [Math]::Min($NameWidth, $longestName)
             $identityHeader = ("{0,-$resolvedNameWidth} {1,10} {2,7}" -f $nameHeader,'SENT','OK%')
             $failureHeader = ('{0,7} {1,7} {2,7}' -f 'TIMEOUT','RCODE','OTHER')
-            $latencyHeader = ('{0,9} {1,9} {2,9} {3,9} {4,9} {5,9}' -f `
-                'AVG MS','STD MS','P50 MS','P95 MS','P99 MS','MAX MS')
+            $latencyHeader = ('{0,9} {1,9} {2,9} {3,9} {4,9} {5,9}' -f @(
+                'AVG MS'
+                'STD MS'
+                'P50 MS'
+                'P95 MS'
+                'P99 MS'
+                'MAX MS'
+            ))
             $columnHeader = $identityHeader + ' | ' + $failureHeader + ' | ' + $latencyHeader
-            $groupHeader = ''.PadRight($identityHeader.Length) + ' | ' + `
-                (Format-CenteredText 'QUERY FAILURES' $failureHeader.Length) + ' | ' + `
+            $groupHeader = @(
+                ''.PadRight($identityHeader.Length)
+                ' | '
+                (Format-CenteredText 'QUERY FAILURES' $failureHeader.Length)
+                ' | '
                 (Format-CenteredText 'SUCCESSFUL SOCKET-OBSERVED LATENCY (MS)' $latencyHeader.Length)
+            ) -join ''
             Write-Host $groupHeader
             Write-Host $columnHeader
             Write-Host ('-' * $columnHeader.Length) -ForegroundColor DarkGray
             foreach ($row in $Rows) {
-                $identity = ("{0,-$resolvedNameWidth} {1,10} {2,7}" -f `
-                    (Format-FixedText $row.$NameProperty $resolvedNameWidth),
-                    ('{0:n0}' -f $row.Sent),
-                    (Format-MetricNumber $row.SuccessRatePercent '0.00'))
-                $failures = ('{0,7} {1,7} {2,7}' -f `
-                    ('{0:n0}' -f $row.Timeout), ('{0:n0}' -f $row.DnsError),
-                    ('{0:n0}' -f $row.OtherFailure))
-                $latency = ('{0,9} {1,9} {2,9} {3,9} {4,9} {5,9}' -f `
-                    (Format-MetricNumber $row.AverageMs), (Format-MetricNumber $row.StdDevMs),
-                    (Format-MetricNumber $row.P50Ms), (Format-MetricNumber $row.P95Ms),
-                    (Format-MetricNumber $row.P99Ms), (Format-MetricNumber $row.MaxMs))
+                $identity = ("{0,-$resolvedNameWidth} {1,10} {2,7}" -f @(
+                    (Format-FixedText $row.$NameProperty $resolvedNameWidth)
+                    ('{0:n0}' -f $row.Sent)
+                    (Format-MetricNumber $row.SuccessRatePercent '0.00')
+                ))
+                $failures = ('{0,7} {1,7} {2,7}' -f @(
+                    ('{0:n0}' -f $row.Timeout)
+                    ('{0:n0}' -f $row.DnsError)
+                    ('{0:n0}' -f $row.OtherFailure)
+                ))
+                $latency = ('{0,9} {1,9} {2,9} {3,9} {4,9} {5,9}' -f @(
+                    (Format-MetricNumber $row.AverageMs)
+                    (Format-MetricNumber $row.StdDevMs)
+                    (Format-MetricNumber $row.P50Ms)
+                    (Format-MetricNumber $row.P95Ms)
+                    (Format-MetricNumber $row.P99Ms)
+                    (Format-MetricNumber $row.MaxMs)
+                ))
                 Write-Host ($identity + ' | ' + $failures + ' | ' + $latency)
             }
         }
@@ -3328,24 +3392,31 @@ namespace DnsPerformanceV350
             Write-Host $metricHeader
             Write-Host ('-' * $metricHeader.Length) -ForegroundColor DarkGray
             for ($s = 0; $s -lt $ServerNames.Count; $s++) {
-                $row = ("{0,-$serverWidth}" -f `
-                    (Format-FixedText (Get-ShortServerName $ServerNames[$s]) $serverWidth))
+                $row = ("{0,-$serverWidth}" -f @(
+                    (Format-FixedText (Get-ShortServerName $ServerNames[$s]) $serverWidth)
+                ))
                 for ($n = 0; $n -lt $Names.Count; $n++) {
                     $metric = $PerServerFqdn[($s * $Names.Count) + $n]
                     if ($Mode -eq 'AverageP95') {
                         $averageText = Format-MetricNumber $metric.AverageMs
                         $stdDevText = Format-MetricNumber $metric.StdDevMs
                         $p95Text = Format-MetricNumber $metric.P95Ms
-                        $row += (' | {0,7} {1,7} {2,7}' -f `
-                            $averageText, $stdDevText, $p95Text)
+                        $row += (' | {0,7} {1,7} {2,7}' -f @(
+                            $averageText
+                            $stdDevText
+                            $p95Text
+                        ))
                     } else {
                         $p99Text = Format-MetricNumber $metric.P99Ms
                         $maxText = Format-MetricNumber $metric.MaxMs
                         $successText = if ($metric.Sent -gt 0) {
                             Format-MetricNumber $metric.SuccessRatePercent '0.0'
                         } else { '-' }
-                        $row += (' | {0,7} {1,7} {2,7}' -f `
-                            $p99Text, $maxText, $successText)
+                        $row += (' | {0,7} {1,7} {2,7}' -f @(
+                            $p99Text
+                            $maxText
+                            $successText
+                        ))
                     }
                 }
                 Write-Host $row
@@ -3359,8 +3430,17 @@ namespace DnsPerformanceV350
             $overall = $Summary.OverallMetrics
             $threshold = [double]$observer.ProcessingThresholdMs
             $pressure = New-Object 'System.Collections.Generic.List[string]'
+            $incidentAffectedRounds = [long]0
+            $incidentObserverRounds = [long]0
+            foreach ($incident in @($Summary.DegradationIncidents)) {
+                $incidentAffectedRounds += [long]$incident.AffectedRoundCount
+                $incidentObserverRounds += [long]$incident.ObserverSuspectRounds
+            }
             if ($overall.SchedulerMiss -gt 0) {
                 $pressure.Add(('{0:n0} scheduler miss(es)' -f $overall.SchedulerMiss))
+            }
+            if ($overall.MaxSchedulerLagMs -ge $Summary.Configuration.SchedulerToleranceMilliseconds) {
+                $pressure.Add(('maximum scheduler lag {0:0.000} ms' -f $overall.MaxSchedulerLagMs))
             }
             if ($overall.ClientProcessingMaxMs -ge $threshold) {
                 $pressure.Add(('client processing max {0:0.000} ms' -f $overall.ClientProcessingMaxMs))
@@ -3374,25 +3454,56 @@ namespace DnsPerformanceV350
 
             Write-Host ''
             Write-Host 'OBSERVER HEALTH' -ForegroundColor Cyan
-            Write-Host ('Warm-up: {0:0.##}s   Parser workers: {1}   Parsed packets: {2:n0}   Maximum parser queue depth: {3:n0}' -f `
-                $observer.WarmupSeconds, $observer.ParserWorkerCount,
-                $observer.ParserProcessedPackets, $observer.ParserMaxQueueDepth)
-            Write-Host ('Parser queue delay ms - Avg: {0}   Max: {1}   Parse duration ms - Avg: {2}   Max: {3}' -f `
-                (Format-MetricNumber $observer.ParserAverageQueueDelayMs '0.000'),
-                (Format-MetricNumber $observer.ParserMaxQueueDelayMs '0.000'),
-                (Format-MetricNumber $observer.ParserAverageParseMs '0.000'),
-                (Format-MetricNumber $observer.ParserMaxParseMs '0.000'))
-            Write-Host ('Process CPU: {0:0.0}%   GC collections 0/1/2: {1:n0}/{2:n0}/{3:n0}   Managed/working-set peak: {4:0.0}/{5:0.0} MB' -f `
-                $observer.ProcessCpuPercent, $observer.Gen0Collections,
-                $observer.Gen1Collections, $observer.Gen2Collections,
-                $observer.MaxManagedMemoryMb, $observer.MaxWorkingSetMb)
-            Write-Host ('Minimum available ThreadPool worker/I/O threads: {0:n0}/{1:n0}   Observer threshold: {2:0.###} ms' -f `
-                $observer.MinAvailableWorkerThreads, $observer.MinAvailableIoThreads, $threshold)
+            Write-Host ('Warm-up: {0:0.##}s   Parser workers: {1}   Parsed packets: {2:n0}   Maximum parser queue depth: {3:n0}' -f @(
+                $observer.WarmupSeconds
+                $observer.ParserWorkerCount
+                $observer.ParserProcessedPackets
+                $observer.ParserMaxQueueDepth
+            ))
+            Write-Host ('Parser queue delay ms - Avg: {0}   Max: {1}   Parse duration ms - Avg: {2}   Max: {3}' -f @(
+                (Format-MetricNumber $observer.ParserAverageQueueDelayMs '0.000')
+                (Format-MetricNumber $observer.ParserMaxQueueDelayMs '0.000')
+                (Format-MetricNumber $observer.ParserAverageParseMs '0.000')
+                (Format-MetricNumber $observer.ParserMaxParseMs '0.000')
+            ))
+            Write-Host ('Process CPU: {0:0.0}%   GC collections 0/1/2: {1:n0}/{2:n0}/{3:n0}   Managed/working-set peak: {4:0.0}/{5:0.0} MB' -f @(
+                $observer.ProcessCpuPercent
+                $observer.Gen0Collections
+                $observer.Gen1Collections
+                $observer.Gen2Collections
+                $observer.MaxManagedMemoryMb
+                $observer.MaxWorkingSetMb
+            ))
+            Write-Host ('Minimum available ThreadPool worker/I/O threads: {0:n0}/{1:n0}   Observer threshold: {2:0.###} ms' -f @(
+                $observer.MinAvailableWorkerThreads
+                $observer.MinAvailableIoThreads
+                $threshold
+            ))
             if ($pressure.Count -eq 0) {
                 Write-Host 'Assessment: NO MATERIAL CLIENT/OBSERVER PRESSURE DETECTED.' -ForegroundColor Green
+            } elseif ($incidentObserverRounds -gt 0) {
+                $overlapPercent = if ($incidentAffectedRounds -gt 0) {
+                    100.0 * $incidentObserverRounds / $incidentAffectedRounds
+                } else { 0.0 }
+                Write-Host 'Assessment: CLIENT/OBSERVER PRESSURE OVERLAPPED DNS DEGRADATION.' -ForegroundColor Yellow
+                Write-Host ('Overlap: {0:n0}/{1:n0} ({2:0.0}%) affected paired-query rounds. Evidence: {3}.' -f @(
+                    $incidentObserverRounds
+                    $incidentAffectedRounds
+                    $overlapPercent
+                    ($pressure -join '; ')
+                ))
             } else {
-                Write-Host ('Assessment: CLIENT/OBSERVER PRESSURE EVIDENCE - ' + ($pressure -join '; ') + '.') -ForegroundColor Yellow
-                Write-Host 'This evidence affects attribution only when it overlaps a degraded paired-query round.'
+                Write-Host 'Assessment: TRANSIENT CLIENT/OBSERVER DELAY OBSERVED.' -ForegroundColor Gray
+                Write-Host ('Evidence: ' + ($pressure -join '; ') + '.')
+                if ($Summary.TotalDegradationIncidents -gt 0) {
+                    if ($Summary.OmittedDegradationIncidents -gt 0) {
+                        Write-Host 'No displayed DNS degradation round overlapped this observer delay; omitted incidents are not represented here.'
+                    } else {
+                        Write-Host 'No qualifying DNS degradation round overlapped this observer delay.'
+                    }
+                } else {
+                    Write-Host 'No qualifying DNS degradation was detected during the run.'
+                }
             }
         }
 
@@ -3407,84 +3518,220 @@ namespace DnsPerformanceV350
                 return ('{0:n0}/{1:n0} ({2:0.0}%)' -f $Numerator, $Denominator, $percent)
             }
 
+            function Format-IncidentDuration {
+                param([double]$Milliseconds)
+                if ($Milliseconds -ge 1000.0) {
+                    return ('{0:0.000}s' -f ($Milliseconds / 1000.0))
+                }
+                return ('{0:0}ms' -f $Milliseconds)
+            }
+
+            function Get-IncidentScopeDisplay {
+                param([string]$PrimaryScope)
+                switch ($PrimaryScope) {
+                    'SINGLE SERVER' { return 'Single server' }
+                    'MULTI SERVER'  { return 'Multiple servers' }
+                    'WIDESPREAD'    { return 'Widespread' }
+                    default         { return $PrimaryScope }
+                }
+            }
+
+            function Get-IncidentPatternLabel {
+                param([Parameter(Mandatory)]$Incident)
+                $scopeLabel = switch ([string]$Incident.PrimaryScope) {
+                    'SINGLE SERVER' { 'SINGLE-SERVER' }
+                    'MULTI SERVER'  { 'MULTI-SERVER' }
+                    'WIDESPREAD'    { 'WIDESPREAD' }
+                    default         { ([string]$Incident.PrimaryScope).Replace(' ', '-') }
+                }
+                $hasFailures = ($Incident.Timeouts + $Incident.DnsErrors + $Incident.OtherFailures) -gt 0
+                $pattern = if ($hasFailures) { 'DNS DEGRADATION' } else { 'LATENCY BURST' }
+                return ($scopeLabel + ' ' + $pattern)
+            }
+
+            function Get-IncidentOverlapSummary {
+                param([Parameter(Mandatory)]$Incident)
+                $peerRounds = [long]$Incident.SharedSlowRounds
+                $observerRounds = [long]$Incident.ObserverSuspectRounds
+                $affectedRounds = [long]$Incident.AffectedRoundCount
+                if ($peerRounds -eq 0 -and $observerRounds -eq 0) {
+                    return 'No peer latency or client/observer pressure overlapped the affected rounds.'
+                }
+                if ($peerRounds -gt 0 -and $observerRounds -eq 0) {
+                    return ('Peer latency overlapped {0}; no client/observer pressure overlapped.' -f @(
+                        (Format-RoundFraction $peerRounds $affectedRounds)
+                    ))
+                }
+                if ($peerRounds -eq 0) {
+                    return ('Client/observer pressure overlapped {0}; no peer latency overlapped.' -f @(
+                        (Format-RoundFraction $observerRounds $affectedRounds)
+                    ))
+                }
+                return ('Peer latency overlapped {0}; client/observer pressure overlapped {1}.' -f @(
+                    (Format-RoundFraction $peerRounds $affectedRounds)
+                    (Format-RoundFraction $observerRounds $affectedRounds)
+                ))
+            }
+
             $criteria = $Summary.Configuration.DegradationAnalysis
             Write-Host ''
             Write-Host 'DNS LATENCY DEGRADATION' -ForegroundColor Cyan
-            Write-Host ('Objectives per server x FQDN: success >=99.9%; successful socket-observed latency <{0:0.##} ms >=99%; <{1:0.##} ms >=99.9%' -f `
-                $criteria.NormalLatencyThresholdMs, $criteria.SevereLatencyThresholdMs)
-            Write-Host ('Evaluation: {0}s sliding windows + full-run check, checked every 1s, minimum {1} violations/objective' -f `
-                $criteria.WindowSeconds, $criteria.MinimumViolations)
-            Write-Host ('Observer correlation threshold: client processing or parser queue >= {0:0.###} ms; scheduler misses/late rounds also count as observer evidence.' -f `
-                $criteria.ObserverProcessingThresholdMs)
+            if ($Summary.TotalDegradationIncidents -eq 0) {
+                Write-Host 'Assessment: NO OBJECTIVE BREACH.' -ForegroundColor Green
+                Write-Host 'Isolated maxima remain available in the ordinary summary and CSV.'
+            } else {
+                $incidentNoun = if ($Summary.TotalDegradationIncidents -eq 1) { 'incident' } else { 'incidents' }
+                $spikeNoun = if ($Summary.TotalDegradationEvents -eq 1) { 'spike' } else { 'spikes' }
+                Write-Host ('DEGRADATION DETECTED: {0:n0} {1} across {2:n0} qualifying server/FQDN {3}.' -f @(
+                    $Summary.TotalDegradationIncidents
+                    $incidentNoun
+                    $Summary.TotalDegradationEvents
+                    $spikeNoun
+                )) -ForegroundColor Yellow
+
+                $displayedIncidents = @($Summary.DegradationIncidents)
+                if ($Summary.TotalDegradationIncidents -eq 1 -and $displayedIncidents.Count -eq 1) {
+                    $primaryIncident = $displayedIncidents[0]
+                    $primaryLabel = Get-IncidentPatternLabel $primaryIncident
+                    $primaryServers = @($primaryIncident.DNS_Servers | ForEach-Object { Get-ShortServerName $_ }) -join ', '
+                    $primaryDuration = Format-IncidentDuration $primaryIncident.DurationMs
+                    $primaryFqdnText = if ($primaryIncident.AffectedNameCount -eq $primaryIncident.TotalNames) {
+                        'all {0:n0} tested FQDNs' -f $primaryIncident.TotalNames
+                    } else {
+                        '{0:n0} of {1:n0} tested FQDNs' -f @(
+                            $primaryIncident.AffectedNameCount
+                            $primaryIncident.TotalNames
+                        )
+                    }
+                    Write-Host ('Assessment: ' + $primaryLabel) -ForegroundColor Yellow
+                    Write-Host ('A {0} {1} was measured on {2}, affecting {3}.' -f @(
+                        $primaryDuration
+                        $(if (($primaryIncident.Timeouts + $primaryIncident.DnsErrors + $primaryIncident.OtherFailures) -gt 0) { 'DNS degradation' } else { 'latency burst' })
+                        $primaryServers
+                        $primaryFqdnText
+                    ))
+                    Write-Host (Get-IncidentOverlapSummary $primaryIncident)
+                } else {
+                    Write-Host 'Assessment: MULTIPLE DNS DEGRADATION INCIDENTS' -ForegroundColor Yellow
+                    Write-Host 'Incident cards below show independently qualifying scope and measured overlap evidence.'
+                }
+
+                foreach ($incident in $displayedIncidents) {
+                    $serverCount = '{0}/{1}' -f $incident.AffectedEndpointCount, $incident.TotalEndpoints
+                    $fqdnCount = '{0}/{1}' -f $incident.AffectedNameCount, $incident.TotalNames
+                    $impactPercent = if ($incident.EvaluatedQueries -gt 0) {
+                        100.0 * $incident.AffectedQueries / $incident.EvaluatedQueries
+                    } else { 0.0 }
+                    $serverList = @($incident.DNS_Servers | ForEach-Object { Get-ShortServerName $_ }) -join ', '
+                    $fqdnList = @($incident.FQDNs) -join ', '
+                    $patternLabel = Get-IncidentPatternLabel $incident
+                    $scopeDisplay = Get-IncidentScopeDisplay $incident.PrimaryScope
+                    $durationText = Format-IncidentDuration $incident.DurationMs
+                    $observerPeerText = if ($incident.SharedSlowRounds -gt 0) {
+                        Format-RoundFraction $incident.ObserverSharedRounds $incident.SharedSlowRounds
+                    } else {
+                        'n/a (no peer-overlapped rounds)'
+                    }
+
+                    Write-Host ''
+                    Write-Host ('INCIDENT {0} - {1}' -f $incident.IncidentNumber, $patternLabel) -ForegroundColor Cyan
+                    Write-Host ('Time:       {0:HH:mm:ss.fff} - {1:HH:mm:ss.fff} UTC   Active: {2}' -f @(
+                        $incident.StartUtc
+                        $incident.EndUtc
+                        $durationText
+                    ))
+                    Write-Host ('Scope:      {0} ({1})   FQDNs: {2}   Pair spikes: {3:n0}' -f @(
+                        $scopeDisplay
+                        $serverCount
+                        $fqdnCount
+                        $incident.PairEventCount
+                    ))
+                    Write-Host ('Objective:  {0}' -f $incident.Objectives)
+                    Write-Host ('Impact:     {0:n0} of {1:n0} queries ({2:0.00}%)   Maximum latency: {3:0.000} ms' -f @(
+                        $incident.AffectedQueries
+                        $incident.EvaluatedQueries
+                        $impactPercent
+                        $incident.MaxResponseMs
+                    ))
+                    Write-Host ('Latency:    10-49 ms: {0:n0}   50+ ms: {1:n0}   Maximum scheduler lag: {2:0.000} ms' -f @(
+                        $incident.Slow10To49Ms
+                        $incident.Slow50MsOrMore
+                        $incident.MaxSchedulerLagMs
+                    ))
+                    Write-Host ('Failures:   Timeout: {0:n0}   DNS RCODE: {1:n0}   Other: {2:n0}' -f @(
+                        $incident.Timeouts
+                        $incident.DnsErrors
+                        $incident.OtherFailures
+                    ))
+                    Write-Host ('Evidence:   Endpoint-only: {0}   Peer-overlapped: {1}' -f @(
+                        (Format-RoundFraction $incident.EndpointOnlyRounds $incident.AffectedRoundCount)
+                        (Format-RoundFraction $incident.SharedSlowRounds $incident.AffectedRoundCount)
+                    ))
+                    Write-Host ('            Majority-overlapped: {0}   Observer-overlapped: {1}' -f @(
+                        (Format-RoundFraction $incident.MajoritySlowRounds $incident.AffectedRoundCount)
+                        (Format-RoundFraction $incident.ObserverSuspectRounds $incident.AffectedRoundCount)
+                    ))
+                    Write-Host ('            Peak simultaneous endpoints: {0}/{1}   Observer + peer overlap: {2}' -f @(
+                        $incident.PeakAffectedEndpoints
+                        $incident.TotalEndpoints
+                        $observerPeerText
+                    ))
+                    Write-Host ('Servers:    ' + $serverList)
+                    Write-Host ('FQDNs:      ' + $fqdnList)
+                }
+
+                if ($Summary.OmittedDegradationIncidents -gt 0) {
+                    $omittedNoun = if ($Summary.OmittedDegradationIncidents -eq 1) { 'incident was' } else { 'incidents were' }
+                    Write-Host ''
+                    Write-Host ('{0:n0} additional {1} omitted; the most severe {2:n0} are shown.' -f @(
+                        $Summary.OmittedDegradationIncidents
+                        $omittedNoun
+                        $Summary.DegradationIncidents.Count
+                    )) -ForegroundColor Yellow
+                }
+            }
 
             $observation = $Summary.LargestSuccessfulObservation
             if ($null -ne $observation) {
-                Write-Host ('Highest successful socket-observed response: {0:0.000} ms | {1} | {2}' -f `
-                    $observation.ResponseTimeMs,
-                    (Get-ShortServerName $observation.DNS_Server), $observation.FQDN)
-                Write-Host ('  Sent UTC {0:yyyy-MM-dd HH:mm:ss.fffffff} | Received UTC {1:yyyy-MM-dd HH:mm:ss.fffffff} | Client processing {2:0.000} ms | End-to-end {3:0.000} ms' -f `
-                    $observation.StartedUtc, $observation.ReceivedUtc,
-                    $observation.ClientProcessingDelayMs, $observation.EndToEndTimeMs)
-                Write-Host ('  Parser queue {0:0.000} ms | Parse {1:0.000} ms | Continuation {2:0.000} ms | Timing source: {3}' -f `
-                    $observation.ParserQueueDelayMs, $observation.ParseDurationMs,
-                    $observation.ContinuationDelayMs, $observation.TimingSource)
+                Write-Host ''
+                Write-Host 'RUN-WIDE MAXIMUM OBSERVATION' -ForegroundColor Cyan
+                Write-Host ('Response:    {0:0.000} ms   Server: {1}   FQDN: {2}' -f @(
+                    $observation.ResponseTimeMs
+                    (Get-ShortServerName $observation.DNS_Server)
+                    $observation.FQDN
+                ))
+                Write-Host ('Time:        Sent {0:yyyy-MM-dd HH:mm:ss.fffffff} UTC   Received {1:yyyy-MM-dd HH:mm:ss.fffffff} UTC' -f @(
+                    $observation.StartedUtc
+                    $observation.ReceivedUtc
+                ))
+                Write-Host ('Client:      Processing {0:0.000} ms   End-to-end {1:0.000} ms   Timing source: {2}' -f @(
+                    $observation.ClientProcessingDelayMs
+                    $observation.EndToEndTimeMs
+                    $observation.TimingSource
+                ))
+                Write-Host ('Parser:      Queue {0:0.000} ms   Parse {1:0.000} ms   Continuation {2:0.000} ms' -f @(
+                    $observation.ParserQueueDelayMs
+                    $observation.ParseDurationMs
+                    $observation.ContinuationDelayMs
+                ))
             }
 
-            if ($Summary.TotalDegradationIncidents -eq 0) {
-                Write-Host 'NO OBJECTIVE BREACH - isolated maxima remain available in the summary and CSV.' -ForegroundColor Green
-                return
-            }
-
-            Write-Host ('DEGRADATION DETECTED: {0:n0} incident(s) across {1:n0} qualifying server/FQDN spike(s).' -f `
-                $Summary.TotalDegradationIncidents, $Summary.TotalDegradationEvents) -ForegroundColor Yellow
-            Write-Host 'PRIMARY SCOPE counts servers whose server/FQDN cells independently breached an objective.'
-            Write-Host 'Paired-round evidence reports simultaneous peer latency and observer overlap separately; it does not change primary scope.'
-
-            $header = (Format-FixedText 'ID' 3) + ' ' + (Format-FixedText 'START UTC' 12) + ' ' + `
-                (Format-FixedText 'END UTC' 12) + (' {0,9} ' -f 'ACTIVE MS') + `
-                (Format-FixedText 'PRIMARY SCOPE' 14) + `
-                (' {0,8} {1,7} {2,10} {3,10} {4,8} {5,10} {6,7} {7,10} {8,8} {9,14} {10,16}' -f `
-                    'SERVERS','FQDNS','AFFECTED','EVALUATED','TIMEOUT','DNS RCODE','OTHER',
-                    '10-49 MS','50+ MS','MAX LATENCY MS','MAX SCHED LAG MS')
-            Write-Host $header
-            Write-Host ('-' * $header.Length) -ForegroundColor DarkGray
-            foreach ($incident in $Summary.DegradationIncidents) {
-                $serverCount = ('{0}/{1}' -f $incident.AffectedEndpointCount, $incident.TotalEndpoints)
-                $fqdnCount = ('{0}/{1}' -f $incident.AffectedNameCount, $incident.TotalNames)
-                $row = (Format-FixedText ([string]$incident.IncidentNumber) 3) + ' ' + `
-                    (Format-FixedText ($incident.StartUtc.ToString('HH:mm:ss.fff')) 12) + ' ' + `
-                    (Format-FixedText ($incident.EndUtc.ToString('HH:mm:ss.fff')) 12) + `
-                    (' {0,9:0} ' -f $incident.DurationMs) + `
-                    (Format-FixedText $incident.PrimaryScope 14) + `
-                    (' {0,8} {1,7} {2,10:n0} {3,10:n0} {4,8:n0} {5,10:n0} {6,7:n0} {7,10:n0} {8,8:n0} {9,14:0.000} {10,16:0.000}' -f `
-                        $serverCount, $fqdnCount, $incident.AffectedQueries,
-                        $incident.EvaluatedQueries, $incident.Timeouts, $incident.DnsErrors,
-                        $incident.OtherFailures, $incident.Slow10To49Ms,
-                        $incident.Slow50MsOrMore, $incident.MaxResponseMs,
-                        $incident.MaxSchedulerLagMs)
-                Write-Host $row
-                $serverList = @($incident.DNS_Servers | ForEach-Object { Get-ShortServerName $_ }) -join ', '
-                Write-Host ('  Incident {0} pair spikes: {1:n0} | Servers: {2}' -f `
-                    $incident.IncidentNumber, $incident.PairEventCount, $serverList)
-                Write-Host ('  FQDNs: ' + (@($incident.FQDNs) -join ', '))
-                Write-Host ('  Paired-round evidence: endpoint-only {0}; peer-overlapped {1}; majority-overlapped {2}.' -f `
-                    (Format-RoundFraction $incident.EndpointOnlyRounds $incident.AffectedRoundCount),
-                    (Format-RoundFraction $incident.SharedSlowRounds $incident.AffectedRoundCount),
-                    (Format-RoundFraction $incident.MajoritySlowRounds $incident.AffectedRoundCount))
-                Write-Host ('  Observer overlap: {0} degraded rounds; {1} peer-overlapped rounds; peak simultaneous endpoints {2}/{3}.' -f `
-                    (Format-RoundFraction $incident.ObserverSuspectRounds $incident.AffectedRoundCount),
-                    (Format-RoundFraction $incident.ObserverSharedRounds $incident.SharedSlowRounds),
-                    $incident.PeakAffectedEndpoints, $incident.TotalEndpoints)
-            }
-            if ($Summary.OmittedDegradationIncidents -gt 0) {
-                Write-Host ('{0:n0} additional incident(s) omitted; the most severe {1:n0} are shown.' -f `
-                    $Summary.OmittedDegradationIncidents, $Summary.DegradationIncidents.Count) -ForegroundColor Yellow
-            }
-            Write-Host 'AFFECTED is query failures plus successful responses of at least 10 ms.'
-            Write-Host 'EVALUATED is the query count in the qualifying per-server/FQDN evaluation buckets.'
-            Write-Host '10-49 MS and 50+ MS are mutually exclusive successful-response counts; failure columns are separate.'
-            Write-Host 'ACTIVE MS uses the first and last violating observations and ends when a complete one-second bucket is clean.'
-            Write-Host 'Primary scope and paired-round evidence describe measured timing only; neither claims a DNS, server, security, load-balancer, or network root cause.'
+            Write-Host ''
+            Write-Host 'INTERPRETATION NOTES' -ForegroundColor Cyan
+            Write-Host ('Objectives per server x FQDN: success >=99.9%; successful socket-observed latency <{0:0.##} ms >=99%; <{1:0.##} ms >=99.9%.' -f @(
+                $criteria.NormalLatencyThresholdMs
+                $criteria.SevereLatencyThresholdMs
+            ))
+            Write-Host ('Detection: complete {0}s sliding windows plus a full-run check, evaluated every 1s with at least {1} violations/objective.' -f @(
+                $criteria.WindowSeconds
+                $criteria.MinimumViolations
+            ))
+            Write-Host ('Observer correlation: client processing or parser queue >= {0:0.###} ms; scheduler misses or late rounds also count as evidence.' -f @(
+                $criteria.ObserverProcessingThresholdMs
+            ))
+            Write-Host 'Impact counts query failures plus successful responses of at least 10 ms; evaluated is the query count in qualifying buckets.'
+            Write-Host 'The 10-49 ms and 50+ ms buckets are mutually exclusive; active time ends when a complete one-second bucket is clean.'
+            Write-Host 'Scope and overlap describe measured timing only; neither claims a DNS, server, security, load-balancer, or network root cause.'
         }
 
         function Write-FinalSummary {
@@ -3493,33 +3740,59 @@ namespace DnsPerformanceV350
             $overall = $Summary.OverallMetrics
             $timing = $Summary.Timing
             Write-Host 'DNS PERFORMANCE TEST SUMMARY' -ForegroundColor Cyan
-            Write-Host ('Endpoints: {0}   Names: {1}   Query type: {2}   Duration: {3}s' -f `
-                $Summary.Configuration.DNS_Server_Endpoints.Count, $Summary.Configuration.FQDNs.Count,
-                $Summary.Configuration.QueryType, $Summary.Configuration.DurationSeconds)
-            Write-Host ('Start UTC: {0:yyyy-MM-dd HH:mm:ss.fff}   End UTC: {1:yyyy-MM-dd HH:mm:ss.fff}   Elapsed: {2:0.000}s' -f `
-                $timing.StartUtc, $timing.EndUtc, $timing.TotalElapsedSeconds)
-            Write-Host ('Target: {0} QPS/server x {1} endpoints = {2} aggregate QPS   Offered aggregate QPS: {3:0.000}' -f `
-                $Summary.Configuration.QueriesPerSecondPerServer,
-                $Summary.Configuration.DNS_Server_Endpoints.Count,
-                $Summary.Configuration.TargetAggregateQps, $timing.OfferedAggregateQps)
+            Write-Host ('Endpoints: {0}   Names: {1}   Query type: {2}   Duration: {3}s' -f @(
+                $Summary.Configuration.DNS_Server_Endpoints.Count
+                $Summary.Configuration.FQDNs.Count
+                $Summary.Configuration.QueryType
+                $Summary.Configuration.DurationSeconds
+            ))
+            Write-Host ('Start UTC: {0:yyyy-MM-dd HH:mm:ss.fff}   End UTC: {1:yyyy-MM-dd HH:mm:ss.fff}   Elapsed: {2:0.000}s' -f @(
+                $timing.StartUtc
+                $timing.EndUtc
+                $timing.TotalElapsedSeconds
+            ))
+            Write-Host ('Target: {0} QPS/server x {1} endpoints = {2} aggregate QPS   Offered aggregate QPS: {3:0.000}' -f @(
+                $Summary.Configuration.QueriesPerSecondPerServer
+                $Summary.Configuration.DNS_Server_Endpoints.Count
+                $Summary.Configuration.TargetAggregateQps
+                $timing.OfferedAggregateQps
+            ))
             Write-Host ('Completion throughput: {0:0.000} QPS' -f $timing.CompletionThroughputQps)
-            Write-Host ('Planned: {0:n0}   Sent: {1:n0}   Not sent: {2:n0}   Scheduler misses: {3:n0}   Concurrency drops: {4:n0}' -f `
-                $overall.Planned, $overall.Sent, $overall.NotSent, $overall.SchedulerMiss, $overall.ConcurrencyDrop)
-            Write-Host ('Responses: {0:n0} ({1:0.000}%)   Successful: {2:n0} ({3:0.000}%)   Timeouts: {4:n0}   DNS RCODE errors: {5:n0}   Other failures: {6:n0}' -f `
-                $overall.ResponseReceived, $overall.ResponseRatePercent, $overall.Success,
-                $overall.SuccessRatePercent, $overall.Timeout, $overall.DnsError, $overall.OtherFailure)
-            Write-Host ('Successful socket-observed response latency ms - Min: {0}   Avg: {1}   StdDev: {2}   P50: {3}   P95: {4}   P99: {5}   Max: {6}' -f `
-                (Format-MetricNumber $overall.MinMs '0.000'), (Format-MetricNumber $overall.AverageMs '0.000'),
-                (Format-MetricNumber $overall.StdDevMs '0.000'), (Format-MetricNumber $overall.P50Ms '0.000'),
-                (Format-MetricNumber $overall.P95Ms '0.000'), (Format-MetricNumber $overall.P99Ms '0.000'),
-                (Format-MetricNumber $overall.MaxMs '0.000'))
-            Write-Host ('Client processing delay ms - Avg: {0}   P95: {1}   P99: {2}   Max: {3}' -f `
-                (Format-MetricNumber $overall.ClientProcessingAverageMs '0.000'),
-                (Format-MetricNumber $overall.ClientProcessingP95Ms '0.000'),
-                (Format-MetricNumber $overall.ClientProcessingP99Ms '0.000'),
-                (Format-MetricNumber $overall.ClientProcessingMaxMs '0.000'))
-            Write-Host ('TCP fallbacks: {0:n0}   Maximum scheduler lag: {1} ms' -f `
-                $overall.TcpFallback, (Format-MetricNumber $overall.MaxSchedulerLagMs '0.000'))
+            Write-Host ('Planned: {0:n0}   Sent: {1:n0}   Not sent: {2:n0}   Scheduler misses: {3:n0}   Concurrency drops: {4:n0}' -f @(
+                $overall.Planned
+                $overall.Sent
+                $overall.NotSent
+                $overall.SchedulerMiss
+                $overall.ConcurrencyDrop
+            ))
+            Write-Host ('Responses: {0:n0} ({1:0.000}%)   Successful: {2:n0} ({3:0.000}%)   Timeouts: {4:n0}   DNS RCODE errors: {5:n0}   Other failures: {6:n0}' -f @(
+                $overall.ResponseReceived
+                $overall.ResponseRatePercent
+                $overall.Success
+                $overall.SuccessRatePercent
+                $overall.Timeout
+                $overall.DnsError
+                $overall.OtherFailure
+            ))
+            Write-Host ('Successful socket-observed response latency ms - Min: {0}   Avg: {1}   StdDev: {2}   P50: {3}   P95: {4}   P99: {5}   Max: {6}' -f @(
+                (Format-MetricNumber $overall.MinMs '0.000')
+                (Format-MetricNumber $overall.AverageMs '0.000')
+                (Format-MetricNumber $overall.StdDevMs '0.000')
+                (Format-MetricNumber $overall.P50Ms '0.000')
+                (Format-MetricNumber $overall.P95Ms '0.000')
+                (Format-MetricNumber $overall.P99Ms '0.000')
+                (Format-MetricNumber $overall.MaxMs '0.000')
+            ))
+            Write-Host ('Client processing delay ms - Avg: {0}   P95: {1}   P99: {2}   Max: {3}' -f @(
+                (Format-MetricNumber $overall.ClientProcessingAverageMs '0.000')
+                (Format-MetricNumber $overall.ClientProcessingP95Ms '0.000')
+                (Format-MetricNumber $overall.ClientProcessingP99Ms '0.000')
+                (Format-MetricNumber $overall.ClientProcessingMaxMs '0.000')
+            ))
+            Write-Host ('TCP fallbacks: {0:n0}   Maximum scheduler lag: {1} ms' -f @(
+                $overall.TcpFallback
+                (Format-MetricNumber $overall.MaxSchedulerLagMs '0.000')
+            ))
             if ($Summary.StatusCounts.Count -gt 0) {
                 Write-Host ('Status counts: ' + (($Summary.StatusCounts | ForEach-Object { '{0}={1:n0}' -f $_.Status, $_.Count }) -join '; '))
             }
@@ -3531,14 +3804,23 @@ namespace DnsPerformanceV350
 
             Write-MetricTable -Title 'PER-SERVER SUMMARY' -Rows $Summary.PerServerMetrics -NameProperty 'DNS_Server' -NameWidth 40
             Write-MetricTable -Title 'PER-FQDN SUMMARY' -Rows $Summary.PerFQDNMetrics -NameProperty 'FQDN' -NameWidth 45
-            Write-CellMatrix -Title 'SERVER x FQDN LATENCY' `
-                -PerServerFqdn $Summary.PerServerFQDNMetrics `
-                -ServerNames $Summary.Configuration.DNS_Server_Endpoints.Label `
-                -Names $Summary.Configuration.FQDNs -Mode AverageP95
-            Write-CellMatrix -Title 'SERVER x FQDN TAIL/SUCCESS' `
-                -PerServerFqdn $Summary.PerServerFQDNMetrics `
-                -ServerNames $Summary.Configuration.DNS_Server_Endpoints.Label `
-                -Names $Summary.Configuration.FQDNs -Mode P99Success
+            $latencyMatrixParameters = @{
+                Title         = 'SERVER x FQDN LATENCY'
+                PerServerFqdn = $Summary.PerServerFQDNMetrics
+                ServerNames   = $Summary.Configuration.DNS_Server_Endpoints.Label
+                Names         = $Summary.Configuration.FQDNs
+                Mode          = 'AverageP95'
+            }
+            Write-CellMatrix @latencyMatrixParameters
+
+            $tailMatrixParameters = @{
+                Title         = 'SERVER x FQDN TAIL/SUCCESS'
+                PerServerFqdn = $Summary.PerServerFQDNMetrics
+                ServerNames   = $Summary.Configuration.DNS_Server_Endpoints.Label
+                Names         = $Summary.Configuration.FQDNs
+                Mode          = 'P99Success'
+            }
+            Write-CellMatrix @tailMatrixParameters
             if ($Summary.CsvOutputPath) { Write-Host ''; Write-Host ('Detailed CSV: ' + $Summary.CsvOutputPath) }
             Write-DegradationTable -Summary $Summary
         }
@@ -3548,12 +3830,12 @@ namespace DnsPerformanceV350
         $normalizedNames = New-Object 'System.Collections.Generic.List[string]'
         $nameSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($name in $FQDNs) {
-            try { $normalized = [DnsPerformanceV350.DnsWire]::NormalizeName($name) }
+            try { $normalized = [DnsPerformanceV353.DnsWire]::NormalizeName($name) }
             catch { throw "Invalid FQDN '$name': $($_.Exception.Message)" }
             if ($nameSet.Add($normalized)) { $normalizedNames.Add($normalized) }
         }
 
-        $targets = New-Object 'System.Collections.Generic.List[DnsPerformanceV350.DnsTarget]'
+        $targets = New-Object 'System.Collections.Generic.List[DnsPerformanceV353.DnsTarget]'
         $targetSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($server in $DNSServers) {
             $addresses = @()
@@ -3568,7 +3850,7 @@ namespace DnsPerformanceV350
                 $addressText = $address.ToString()
                 if (-not $targetSet.Add($addressText)) { continue }
                 $label = if ($addresses.Count -gt 1) { "$server [$addressText]" } else { $server }
-                $targets.Add((New-Object DnsPerformanceV350.DnsTarget -ArgumentList $label, $addressText))
+                $targets.Add((New-Object DnsPerformanceV353.DnsTarget -ArgumentList $label, $addressText))
             }
         }
         if ($targets.Count -eq 0) { throw 'No unique DNS server endpoints remain after resolution.' }
@@ -3604,7 +3886,7 @@ namespace DnsPerformanceV350
             }
         }
 
-        $options = New-Object DnsPerformanceV350.RunnerOptions
+        $options = New-Object DnsPerformanceV353.RunnerOptions
         $options.QueriesPerSecondPerServer = $QueriesPerSecond
         $options.DurationSeconds = $DurationSeconds
         $options.TimeoutMilliseconds = $TimeoutMilliseconds
@@ -3626,8 +3908,8 @@ namespace DnsPerformanceV350
         $options.ProcessingWorkerCount = $ProcessingWorkerCount
         $options.ObserverProcessingThresholdMs = $ObserverProcessingThresholdMilliseconds
 
-        $queryTypeCode = [DnsPerformanceV350.DnsWire]::GetQueryTypeCode($QueryType)
-        $runner = [DnsPerformanceV350.DnsLoadRunner]::Create(
+        $queryTypeCode = [DnsPerformanceV353.DnsWire]::GetQueryTypeCode($QueryType)
+        $runner = [DnsPerformanceV353.DnsLoadRunner]::Create(
             $targets.ToArray(), $normalizedNames.ToArray(), $queryTypeCode, $options)
         $cancellation = New-Object System.Threading.CancellationTokenSource
         $runnerTask = $null
@@ -3647,21 +3929,26 @@ namespace DnsPerformanceV350
         try {
             $runnerTask = $runner.RunAsync($cancellation.Token)
             $live = $runner.GetLiveSnapshot($RollingWindowSeconds)
-            $lines = Get-DashboardLines -Snapshot $live -Progress $runner.Progress `
-                -Names $normalizedNames.ToArray() -TargetAggregateQps $aggregateQps `
-                -PerServerQps $QueriesPerSecond -Duration $DurationSeconds `
-                -EndpointCount $targets.Count -Planned $plannedQueries `
-                -OutstandingLimit $MaxOutstandingPerServer
+            $dashboardParameters = @{
+                Snapshot           = $live
+                Progress           = $runner.Progress
+                Names              = $normalizedNames.ToArray()
+                TargetAggregateQps = $aggregateQps
+                PerServerQps       = $QueriesPerSecond
+                Duration           = $DurationSeconds
+                EndpointCount      = $targets.Count
+                Planned            = $plannedQueries
+                OutstandingLimit   = $MaxOutstandingPerServer
+            }
+            $lines = Get-DashboardLines @dashboardParameters
             Show-Dashboard -Lines $lines -Mode $dashboardRenderingMode -IsIse $isIse -ErrorAction Stop
             $displayTimer = [Diagnostics.Stopwatch]::StartNew()
             while (-not $runnerTask.IsCompleted) {
                 if ($displayTimer.Elapsed.TotalSeconds -ge $DisplayIntervalSeconds) {
                     $live = $runner.GetLiveSnapshot($RollingWindowSeconds)
-                    $lines = Get-DashboardLines -Snapshot $live -Progress $runner.Progress `
-                        -Names $normalizedNames.ToArray() -TargetAggregateQps $aggregateQps `
-                        -PerServerQps $QueriesPerSecond -Duration $DurationSeconds `
-                        -EndpointCount $targets.Count -Planned $plannedQueries `
-                        -OutstandingLimit $MaxOutstandingPerServer
+                    $dashboardParameters.Snapshot = $live
+                    $dashboardParameters.Progress = $runner.Progress
+                    $lines = Get-DashboardLines @dashboardParameters
                     Show-Dashboard -Lines $lines -Mode $dashboardRenderingMode -IsIse $isIse -ErrorAction Stop
                     $displayTimer.Restart()
                 }
@@ -3690,8 +3977,14 @@ namespace DnsPerformanceV350
             Convert-MetricSnapshot -Metric $item.Metrics -NameProperty 'FQDN' -Name $item.Name
         }
         $perServerFqdnMetrics = foreach ($item in $finalSnapshot.PerServerFqdn) {
-            Convert-MetricSnapshot -Metric $item.Metrics -NameProperty 'DNS_Server' `
-                -Name $item.Server -Address $item.ServerAddress -FQDN $item.QueryName
+            $metricParameters = @{
+                Metric       = $item.Metrics
+                NameProperty = 'DNS_Server'
+                Name         = $item.Server
+                Address      = $item.ServerAddress
+                FQDN         = $item.QueryName
+            }
+            Convert-MetricSnapshot @metricParameters
         }
         $statusMetrics = foreach ($item in $finalSnapshot.StatusCounts) {
             [pscustomobject]@{ Status = $item.Name; Count = $item.Count }
