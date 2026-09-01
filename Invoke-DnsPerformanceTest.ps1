@@ -107,8 +107,12 @@ function Invoke-DnsPerformanceTest {
         Treat a NOERROR response with zero answer records as successful.
 
     .PARAMETER CsvOutputPath
-        Optional streaming CSV containing one row per planned query. Large tests can
-        produce very large files; rows are written during the test instead of retained.
+        Optional CSV containing one row per planned query. Large tests are streamed
+        during the workload. When CoordinatedCapture is enabled, the completed file is
+        then enriched in a bounded-memory pass with correlated client/server Npcap
+        timestamps, packet-boundary durations, and directional delay deltas. Rows for
+        endpoints that cannot provide server-side capture are labeled ClientOnly and
+        retain the workload's normal UdpSocketReceive timing.
 
     .PARAMETER IncludeDetailedResults
         Return individual query rows in memory. This is rejected when the planned count
@@ -122,6 +126,76 @@ function Invoke-DnsPerformanceTest {
         warm-up query plan. The function stops before sending any queries when
         either phase would exceed this value.
 
+    .PARAMETER CoordinatedCapture
+        Attempt coordinated Npcap capture on this client and each DNS endpoint before
+        the measured phase begins. An endpoint that does not support Windows remoting
+        or server-side Npcap capture (for example, a load balancer VIP or Linux DNS
+        server) automatically continues with normal client-side socket timing. Warm-up
+        completes first; the runner then pauses in an ARMING phase until the available
+        capture handles report ready. Server-side helpers are launched with PowerShell
+        Remoting and removed after results are returned. Raw packets are parsed and
+        discarded in compiled C#. Up to 16 resolved endpoints can participate.
+
+    .PARAMETER CaptureComputerMap
+        Optional mapping from a DNS server argument, resolved endpoint address, or
+        endpoint label to the computer name used for PowerShell Remoting. This is
+        used when a VIP or alias should be correlated with capture on a specific
+        Windows backend. Without a usable mapping, an endpoint that cannot be remoted
+        to is retained as ClientOnly rather than stopping the test.
+
+    .PARAMETER CaptureCredential
+        Optional credential for server-side PowerShell Remoting. When omitted, the
+        current Windows identity is tried first. When a failure specifically indicates
+        rejected or unauthorized credentials, an interactive run prompts once for
+        alternate credentials and retries before the DNS workload starts. A failure
+        that indicates an unavailable or non-Windows remoting target does not prompt;
+        that endpoint continues as ClientOnly. No delegation or second hop is required.
+
+    .PARAMETER CaptureUseSSL
+        Use the WinRM HTTPS listener for coordinated server captures.
+
+    .PARAMETER CaptureStartupTimeoutSeconds
+        Maximum time per endpoint for server-side remoting preflight, and the maximum
+        time for the accepted capture endpoints to open Npcap handles and report ready.
+
+    .PARAMETER CaptureGraceSeconds
+        Additional capture time after the planned scheduling duration. This permits
+        outstanding DNS responses to drain through the ordinary query timeout.
+
+    .PARAMETER CaptureMaximumPacketsPerEndpoint
+        Safety limit on request and response packets accepted by each local or remote
+        capture. Reaching the limit makes coordinated evidence incomplete.
+
+    .PARAMETER CaptureSlowTransactionThresholdMilliseconds
+        Minimum client-wire, server-turnaround, or combined-network remainder used
+        when retaining bounded slow-transaction evidence in the returned summary.
+
+    .PARAMETER CaptureMaximumSlowTransactions
+        Maximum slow coordinated transactions returned per endpoint. All matched
+        transactions still contribute to the distribution summaries. Retained rows
+        include the client request/response and server receive/send UTC timestamps.
+
+    .PARAMETER TraceConditionalForwarding
+        Extend CoordinatedCapture on each DNS server to trace uncached queries through
+        matching conditional forwarder zones. The server records the configured master
+        list and the observed upstream attempt order, response or no-response interval,
+        fallback target, RCODE, UDP/TCP transport, cache-served or otherwise unattributed
+        client transactions, and coalesced client requests. A ClientOnly endpoint is
+        labeled unavailable for this server-side trace while other endpoints continue.
+        This switch requires CoordinatedCapture and never clears or changes the cache.
+
+    .PARAMETER CaptureMaximumForwardingPacketsPerEndpoint
+        Safety limit for relevant client and conditional-forwarder DNS packets accepted
+        by the additional server-side trace handle. It is independent of the ordinary
+        coordinated packet limit because an uncached transaction can contain both a
+        client request/response and one or more upstream attempts. Events are retained
+        in memory as compact records and returned compressed; no PCAP is written.
+
+    .PARAMETER CaptureMaximumForwardingFlights
+        Maximum detailed forwarding flights returned per endpoint. Aggregate counters
+        include every observed flight. When the limit is exceeded, fallback, failed,
+        and longest flights are retained first.
+
     .EXAMPLE
         $testParameters = @{
             FQDNs = 'app1.contoso.com','app2.contoso.com','www.microsoft.com'
@@ -130,6 +204,25 @@ function Invoke-DnsPerformanceTest {
             DurationSeconds = 120
         }
         $result = Invoke-DnsPerformanceTest @testParameters
+
+    .EXAMPLE
+        $captureMap = @{
+            '10.20.30.10' = 'dns01.contoso.com'
+            '10.20.30.11' = 'dns02.contoso.com'
+        }
+        $testParameters = @{
+            FQDNs             = 'cached-app.contoso.com'
+            DNSServers        = '10.20.30.10','10.20.30.11'
+            QueriesPerSecond  = 400
+            DurationSeconds   = 900
+            CoordinatedCapture = $true
+            TraceConditionalForwarding = $true
+            CaptureComputerMap = $captureMap
+        }
+        $result = Invoke-DnsPerformanceTest @testParameters
+        $result.CoordinatedCapture.Endpoints |
+            Select-Object DNS_Server,MatchedPairs,CoveragePercent,
+                ClientWire,ServerTurnaround,NetworkRemainder
 
     .EXAMPLE
         $testParameters = @{
@@ -146,11 +239,14 @@ function Invoke-DnsPerformanceTest {
         PSCustomObject containing configuration, timing, cumulative metrics, status
         counts, RCODE counts, observer-health evidence, DNS latency incidents with
         independently qualifying scope and paired-round evidence, their server-by-FQDN
-        pair details, and optional detailed results.
+        pair details, optional detailed results, and optional coordinated Npcap timing
+        evidence with per-endpoint capture diagnostics. When requested, conditional-
+        forwarding evidence includes per-flight upstream attempts and per-master
+        response metrics.
 
     .NOTES
         Name: Invoke-DnsPerformanceTest
-        Version: 3.5.3
+        Version: 4.2.6
         PowerShell: Windows PowerShell 5.1 (including ISE) or PowerShell 7+
 
         This is a controlled production probe. Confirm that the requested aggregate
@@ -193,6 +289,56 @@ function Invoke-DnsPerformanceTest {
         Packet capture and host/network telemetry remain the authority for root-cause
         attribution.
 
+        CoordinatedCapture adds packet-boundary measurements without changing the
+        normal DNS workload. Client packet-observed latency is measured between the
+        client Npcap request and response timestamps. Server packet turnaround is
+        measured between the corresponding server Npcap receive and transmit
+        timestamps. Combined network time is client packet-observed latency minus
+        server packet turnaround; it combines both network directions and any
+        difference between the two capture points. Clock synchronization is
+        not required because each duration is calculated on a single computer. The
+        absolute client and server UTC timestamps returned for retained slow pairs do
+        reflect their respective host clocks and should only be compared directly when
+        those clocks are suitably synchronized.
+
+        If server-side capture is unavailable for one endpoint, that endpoint is
+        labeled ClientOnly. Its normal socket-observed metrics remain in the ordinary
+        tables and CSV, but server turnaround, combined network time, directional
+        deltas, and conditional-forwarding evidence are unavailable. Other endpoints
+        in the same run still receive full coordinated analysis.
+
+        OutboundDelayDeltaMs and ReturnDelayDeltaMs are directional changes relative
+        to a nearby low-delay transaction from the same DNS endpoint. For each
+        one-second interval, the reference is an actual transaction near the 10th
+        percentile of combined network time within an approximately 11-second window.
+        Subtracting the reference cancels a stable client/server clock offset. These
+        fields show which direction became slower or faster than its nearby baseline;
+        they are not absolute one-way latency. A clock adjustment or material drift
+        inside the baseline window can invalidate the directional split.
+
+        TraceConditionalForwarding adds a second, narrow server-side capture handle.
+        It discovers only conditional forwarder zones matching the tested FQDNs and
+        captures DNS between the test client, caching server, and those configured
+        masters. A missing response means no response was observed at the caching server
+        before its next action; it does not by itself prove the remote server was down.
+        Repeated client requests can be coalesced behind one upstream resolution flight.
+        Queries without an observed flight can be cache hits, locally answered queries,
+        or unattributed traffic and are labeled accordingly rather than assumed cached.
+        Attempt order is reported from packets, not inferred from configuration, because
+        Windows DNS can adapt its forwarder preference. TCP DNS parsing is best effort
+        when a message spans multiple TCP segments. The trace is restricted to the
+        tested question names and does not follow different CNAME-derived child names.
+        All relevant egress routes must use the DNS endpoint's adapter; the script stops
+        with a clear error if it detects a matching master on another adapter.
+
+        Npcap does not normally require the calling PowerShell process to be elevated.
+        If Npcap was installed in admin-only mode, its local helper requests UAC when
+        the capture handle is opened. Remote Npcap access is verified during preflight;
+        an interactive run can prompt once when the failure specifically indicates
+        rejected or unauthorized credentials. Unavailable and non-Windows remoting
+        targets automatically continue with client-side timing. Unattended runs should
+        supply CaptureCredential when alternate Windows credentials are required.
+
     .LINK
         https://datatracker.ietf.org/doc/html/rfc9199#section-3.5.1
 
@@ -213,6 +359,9 @@ function Invoke-DnsPerformanceTest {
 
     .LINK
         https://learn.microsoft.com/en-us/dotnet/api/system.threading.threadpool.setminthreads?view=netframework-4.8.1
+
+    .LINK
+        https://npcap.com/guide/npcap-users-guide.html
     #>
     [CmdletBinding()]
     param (
@@ -289,11 +438,42 @@ function Invoke-DnsPerformanceTest {
         [long]$MaximumDetailedResults = 250000,
 
         [ValidateRange(1, 1000000000)]
-        [long]$MaximumPlannedQueries = 10000000
+        [long]$MaximumPlannedQueries = 10000000,
+
+        [switch]$CoordinatedCapture,
+
+        [hashtable]$CaptureComputerMap,
+
+        [System.Management.Automation.PSCredential]$CaptureCredential,
+
+        [switch]$CaptureUseSSL,
+
+        [ValidateRange(5, 300)]
+        [int]$CaptureStartupTimeoutSeconds = 45,
+
+        [ValidateRange(1, 60)]
+        [int]$CaptureGraceSeconds = 5,
+
+        [ValidateRange(1000, 100000000)]
+        [int]$CaptureMaximumPacketsPerEndpoint = 1000000,
+
+        [ValidateRange(0.0, 60000.0)]
+        [double]$CaptureSlowTransactionThresholdMilliseconds = 10.0,
+
+        [ValidateRange(0, 100000)]
+        [int]$CaptureMaximumSlowTransactions = 1000,
+
+        [switch]$TraceConditionalForwarding,
+
+        [ValidateRange(1000, 100000000)]
+        [int]$CaptureMaximumForwardingPacketsPerEndpoint = 3000000,
+
+        [ValidateRange(1, 100000)]
+        [int]$CaptureMaximumForwardingFlights = 5000
     )
 
     begin {
-        if (-not ('DnsPerformanceV353.DnsLoadRunner' -as [type])) {
+        if (-not ('DnsPerformanceV420.DnsLoadRunner' -as [type])) {
             Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition @'
 using System;
 using System.Collections.Concurrent;
@@ -308,7 +488,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace DnsPerformanceV353
+namespace DnsPerformanceV420
 {
     public sealed class DnsTarget
     {
@@ -349,6 +529,7 @@ namespace DnsPerformanceV353
         public int WarmupSeconds { get; set; }
         public int ProcessingWorkerCount { get; set; }
         public double ObserverProcessingThresholdMs { get; set; }
+        public bool WaitForMeasurementRelease { get; set; }
     }
 
     public sealed class RunnerProgress
@@ -401,6 +582,9 @@ namespace DnsPerformanceV353
         public string ServerAddress { get; set; }
         public string QueryName { get; set; }
         public string QueryType { get; set; }
+        public ushort ClientPort { get; set; }
+        public ushort TransactionId { get; set; }
+        public uint CaptureOccurrence { get; set; }
         public string Status { get; set; }
         public bool Sent { get; set; }
         public bool ResponseReceived { get; set; }
@@ -1206,7 +1390,7 @@ namespace DnsPerformanceV353
             {
                 using (StreamWriter writer = new StreamWriter(path, false, new UTF8Encoding(true), 65536))
                 {
-                    writer.WriteLine("Sequence,ScheduledUtc,StartedUtc,ReceivedUtc,CompletedUtc,Server,ServerAddress,QueryName,QueryType,Status,Sent,ResponseReceived,Success,TcpFallbackUsed,Truncated,AnswerCount,RCode,RCodeName,ResponseTimeMs,ClientProcessingDelayMs,ParserQueueDelayMs,ParseDurationMs,ContinuationDelayMs,EndToEndTimeMs,TimingSource,SchedulerLagMs,ErrorMessage");
+                    writer.WriteLine("Sequence,ScheduledUtc,StartedUtc,ReceivedUtc,CompletedUtc,Server,ServerAddress,QueryName,QueryType,ClientPort,TransactionId,CaptureOccurrence,Status,Sent,ResponseReceived,Success,TcpFallbackUsed,Truncated,AnswerCount,RCode,RCodeName,ResponseTimeMs,ClientProcessingDelayMs,ParserQueueDelayMs,ParseDurationMs,ContinuationDelayMs,EndToEndTimeMs,TimingSource,SchedulerLagMs,ErrorMessage");
                     StringBuilder batch = new StringBuilder(131072);
                     int batchCount = 0;
                     foreach (DnsQueryResult result in queue.GetConsumingEnumerable())
@@ -1218,7 +1402,11 @@ namespace DnsPerformanceV353
                             Csv(result.StartedUtc == DateTime.MinValue ? "" : result.StartedUtc.ToString("o", CultureInfo.InvariantCulture)),
                             Csv(result.ReceivedUtc == DateTime.MinValue ? "" : result.ReceivedUtc.ToString("o", CultureInfo.InvariantCulture)),
                             Csv(result.CompletedUtc == DateTime.MinValue ? "" : result.CompletedUtc.ToString("o", CultureInfo.InvariantCulture)),
-                            Csv(result.Server), Csv(result.ServerAddress), Csv(result.QueryName), Csv(result.QueryType), Csv(result.Status),
+                            Csv(result.Server), Csv(result.ServerAddress), Csv(result.QueryName), Csv(result.QueryType),
+                            result.Sent ? result.ClientPort.ToString(CultureInfo.InvariantCulture) : "",
+                            result.Sent ? result.TransactionId.ToString(CultureInfo.InvariantCulture) : "",
+                            result.Sent ? result.CaptureOccurrence.ToString(CultureInfo.InvariantCulture) : "",
+                            Csv(result.Status),
                             result.Sent.ToString(), result.ResponseReceived.ToString(), result.Success.ToString(),
                             result.TcpFallbackUsed.ToString(), result.Truncated.ToString(),
                             result.AnswerCount.ToString(CultureInfo.InvariantCulture),
@@ -2277,6 +2465,9 @@ namespace DnsPerformanceV353
         private readonly object pendingSync = new object();
         private readonly Dictionary<ushort, PendingResponse> pending = new Dictionary<ushort, PendingResponse>();
         private readonly SemaphoreSlim outstanding;
+        private readonly ushort clientPort;
+        private readonly Dictionary<ushort, uint> measurementOccurrences =
+            new Dictionary<ushort, uint>();
         private volatile bool stopping;
         private int nextTransactionId = Environment.TickCount;
 
@@ -2291,6 +2482,7 @@ namespace DnsPerformanceV353
             socket.SendBufferSize = Math.Max(socket.SendBufferSize, 1024 * 1024);
             socket.ReceiveBufferSize = Math.Max(socket.ReceiveBufferSize, 4 * 1024 * 1024);
             socket.Connect(new IPEndPoint(target.IpAddress, 53));
+            clientPort = checked((ushort)((IPEndPoint)socket.LocalEndPoint).Port);
             receiveThread = new Thread(ReceiveLoop);
             receiveThread.IsBackground = true;
             receiveThread.Name = "DNS receive " + target.Label;
@@ -2310,8 +2502,10 @@ namespace DnsPerformanceV353
             CancellationToken cancellationToken)
         {
             ushort id;
+            uint captureOccurrence;
             PendingResponse pendingResponse;
-            Reserve(queryName, queryType, out id, out pendingResponse);
+            Reserve(queryName, queryType, sequence >= 0, out id, out captureOccurrence,
+                out pendingResponse);
             byte[] query = DnsWire.BuildQuery(id, queryName, queryType,
                 options.RecursionDesired, options.UseEdns, options.UdpPayloadSize);
             DateTime startedUtc = DateTime.UtcNow;
@@ -2331,6 +2525,9 @@ namespace DnsPerformanceV353
                 ServerAddress = target.Address,
                 QueryName = queryName,
                 QueryType = DnsWire.GetQueryTypeName(queryType),
+                ClientPort = clientPort,
+                TransactionId = id,
+                CaptureOccurrence = captureOccurrence,
                 Status = "ClientError",
                 Sent = true,
                 RCode = -1,
@@ -2477,8 +2674,8 @@ namespace DnsPerformanceV353
             return result;
         }
 
-        private void Reserve(string queryName, ushort queryType,
-            out ushort id, out PendingResponse response)
+        private void Reserve(string queryName, ushort queryType, bool measured,
+            out ushort id, out uint captureOccurrence, out PendingResponse response)
         {
             lock (pendingSync)
             {
@@ -2487,6 +2684,13 @@ namespace DnsPerformanceV353
                     id = unchecked((ushort)++nextTransactionId);
                     if (!pending.ContainsKey(id))
                     {
+                        captureOccurrence = 0;
+                        if (measured)
+                        {
+                            measurementOccurrences.TryGetValue(id, out captureOccurrence);
+                            captureOccurrence++;
+                            measurementOccurrences[id] = captureOccurrence;
+                        }
                         response = new PendingResponse
                         {
                             Id = id,
@@ -2806,12 +3010,19 @@ namespace DnsPerformanceV353
         private readonly RunnerOptions options;
         private readonly AggregationStore store;
         private readonly PacketParserPool parserPool;
+        private readonly ManualResetEventSlim measurementGate =
+            new ManualResetEventSlim(false);
         private RunnerCompletion completion;
         private int started;
         private int disposed;
 
         public RunnerProgress Progress { get; private set; }
         public RunnerCompletion Completion { get { return completion; } }
+
+        public void ReleaseMeasurementGate()
+        {
+            measurementGate.Set();
+        }
 
         private DnsLoadRunner(DnsTarget[] targets, string[] names, ushort queryType,
             RunnerOptions options)
@@ -2895,6 +3106,12 @@ namespace DnsPerformanceV353
                     GC.WaitForPendingFinalizers();
                 }
                 parserPool.ResetStatistics();
+                if (options.WaitForMeasurementRelease)
+                {
+                    Progress.Phase = "ARMING";
+                    while (!measurementGate.Wait(100))
+                        cancellationToken.ThrowIfCancellationRequested();
+                }
                 observer = new ObserverMonitor(options, parserPool);
                 observer.Start();
                 // Capture the UTC epoch and start the scheduler clock together.
@@ -3091,12 +3308,3037 @@ namespace DnsPerformanceV353
         public void Dispose()
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            measurementGate.Set();
             try { store.DisposeCsv(); }
-            finally { parserPool.Dispose(); }
+            finally
+            {
+                parserPool.Dispose();
+                measurementGate.Dispose();
+            }
         }
     }
 }
 '@
+        }
+
+        $coordinatedCaptureTypeDefinition = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.IO.Compression;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace DnsCoordinatedCaptureV424
+{
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct BpfProgram
+    {
+        public uint Length;
+        public IntPtr Instructions;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PcapTimeval
+    {
+        public int Seconds;
+        public int Microseconds;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PcapPacketHeader
+    {
+        public PcapTimeval Timestamp;
+        public uint CapturedLength;
+        public uint OriginalLength;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PcapStatisticsNative
+    {
+        public uint Received;
+        public uint Dropped;
+        public uint InterfaceDropped;
+        // WinPcap-compatible Windows headers include a fourth capture counter.
+        // Keeping the native structure at that size is safe across Npcap builds;
+        // pcap_stats() only exposes the first three portable fields here.
+        public uint Captured;
+    }
+
+    internal static class PcapNative
+    {
+        internal const int ErrorBufferSize = 512;
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl,
+            CharSet = CharSet.Ansi)]
+        internal static extern IntPtr pcap_create(string source, StringBuilder errorBuffer);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_set_snaplen(IntPtr handle, int snapshotLength);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_set_promisc(IntPtr handle, int enabled);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_set_timeout(IntPtr handle, int timeoutMilliseconds);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_set_buffer_size(IntPtr handle, int bufferBytes);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_activate(IntPtr handle);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_datalink(IntPtr handle);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl,
+            CharSet = CharSet.Ansi)]
+        internal static extern int pcap_compile(IntPtr handle, out BpfProgram program,
+            string filter, int optimize, uint networkMask);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_setfilter(IntPtr handle, ref BpfProgram program);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void pcap_freecode(ref BpfProgram program);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_next_ex(IntPtr handle, out IntPtr header,
+            out IntPtr packetData);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_stats(IntPtr handle, out PcapStatisticsNative statistics);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr pcap_geterr(IntPtr handle);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr pcap_lib_version();
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void pcap_close(IntPtr handle);
+
+        internal static string Error(IntPtr handle)
+        {
+            IntPtr value = handle == IntPtr.Zero ? IntPtr.Zero : pcap_geterr(handle);
+            return value == IntPtr.Zero ? "Unknown Npcap error." : Marshal.PtrToStringAnsi(value);
+        }
+
+        internal static string Version()
+        {
+            IntPtr value = pcap_lib_version();
+            return value == IntPtr.Zero ? "Unknown" : Marshal.PtrToStringAnsi(value);
+        }
+    }
+
+    internal struct CaptureKey : IEquatable<CaptureKey>
+    {
+        internal ushort ClientPort;
+        internal ushort TransactionId;
+
+        internal CaptureKey(ushort clientPort, ushort transactionId)
+        {
+            ClientPort = clientPort;
+            TransactionId = transactionId;
+        }
+
+        public bool Equals(CaptureKey other)
+        {
+            return ClientPort == other.ClientPort && TransactionId == other.TransactionId;
+        }
+
+        public override bool Equals(object value)
+        {
+            return value is CaptureKey && Equals((CaptureKey)value);
+        }
+
+        public override int GetHashCode()
+        {
+            return (ClientPort << 16) ^ TransactionId;
+        }
+    }
+
+    internal sealed class PendingCapture
+    {
+        internal uint Occurrence;
+        internal long RequestMicroseconds;
+    }
+
+    internal struct CapturePair
+    {
+        internal ushort ClientPort;
+        internal ushort TransactionId;
+        internal uint Occurrence;
+        internal long RequestMicroseconds;
+        internal long ResponseMicroseconds;
+    }
+
+    public sealed class CaptureReadyInfo
+    {
+        public string ComputerName { get; internal set; }
+        public string LocalAddress { get; internal set; }
+        public string PeerAddress { get; internal set; }
+        public string AdapterName { get; internal set; }
+        public string DeviceName { get; internal set; }
+        public string Filter { get; internal set; }
+        public string NpcapVersion { get; internal set; }
+        public string TimestampSource { get; internal set; }
+    }
+
+    public sealed class CaptureResult
+    {
+        public string ComputerName { get; internal set; }
+        public string LocalAddress { get; internal set; }
+        public string PeerAddress { get; internal set; }
+        public string AdapterName { get; internal set; }
+        public string DeviceName { get; internal set; }
+        public string Filter { get; internal set; }
+        public string NpcapVersion { get; internal set; }
+        public string TimestampSource { get; internal set; }
+        public DateTime CaptureStartUtc { get; internal set; }
+        public DateTime CaptureEndUtc { get; internal set; }
+        public long ParsedPackets { get; internal set; }
+        public long QueryPackets { get; internal set; }
+        public long ResponsePackets { get; internal set; }
+        public long CompletedPairs { get; internal set; }
+        public long UnmatchedQueries { get; internal set; }
+        public long UnmatchedResponses { get; internal set; }
+        public long PcapReceived { get; internal set; }
+        public long PcapDropped { get; internal set; }
+        public long InterfaceDropped { get; internal set; }
+        public bool StatisticsAvailable { get; internal set; }
+        public bool PacketLimitReached { get; internal set; }
+        public byte[] CompressedPairs { get; internal set; }
+    }
+
+    public sealed class CaptureMetricSummary
+    {
+        public long Count { get; internal set; }
+        public double MinimumMs { get; internal set; }
+        public double AverageMs { get; internal set; }
+        public double StandardDeviationMs { get; internal set; }
+        public double P50Ms { get; internal set; }
+        public double P95Ms { get; internal set; }
+        public double P99Ms { get; internal set; }
+        public double MaximumMs { get; internal set; }
+    }
+
+    public sealed class SlowCaptureTransaction
+    {
+        public DateTime ClientRequestUtc { get; internal set; }
+        public DateTime ClientResponseUtc { get; internal set; }
+        public DateTime ServerReceiveUtc { get; internal set; }
+        public DateTime ServerSendUtc { get; internal set; }
+        public ushort ClientPort { get; internal set; }
+        public ushort TransactionId { get; internal set; }
+        public uint Occurrence { get; internal set; }
+        public double ClientWireMs { get; internal set; }
+        public double ServerTurnaroundMs { get; internal set; }
+        public double NetworkRemainderMs { get; internal set; }
+        public DateTime DirectionalBaselineUtc { get; internal set; }
+        public double DirectionalBaselineCombinedNetworkMs { get; internal set; }
+        public double OutboundDelayDeltaMs { get; internal set; }
+        public double ReturnDelayDeltaMs { get; internal set; }
+        internal double Score { get; set; }
+        internal long TieBreaker { get; set; }
+    }
+
+    internal sealed class SlowCaptureComparer : IComparer<SlowCaptureTransaction>
+    {
+        public int Compare(SlowCaptureTransaction x, SlowCaptureTransaction y)
+        {
+            int value = x.Score.CompareTo(y.Score);
+            if (value != 0) return value;
+            return x.TieBreaker.CompareTo(y.TieBreaker);
+        }
+    }
+
+    public sealed class CoordinatedCaptureAnalysis
+    {
+        public string Server { get; internal set; }
+        public string ServerAddress { get; internal set; }
+        public long LocalPairs { get; internal set; }
+        public long ServerPairs { get; internal set; }
+        public long MatchedPairs { get; internal set; }
+        public long UnmatchedLocalPairs { get; internal set; }
+        public long UnmatchedServerPairs { get; internal set; }
+        public long NegativeNetworkRemainders { get; internal set; }
+        public double CoveragePercent { get; internal set; }
+        public CaptureMetricSummary ClientWire { get; internal set; }
+        public CaptureMetricSummary ServerTurnaround { get; internal set; }
+        public CaptureMetricSummary NetworkRemainder { get; internal set; }
+        public CaptureMetricSummary OutboundDelayDelta { get; internal set; }
+        public CaptureMetricSummary ReturnDelayDelta { get; internal set; }
+        public string DirectionalDeltaMethod { get; internal set; }
+        public SlowCaptureTransaction[] SlowTransactions { get; internal set; }
+    }
+
+    public sealed class CaptureCsvEndpoint
+    {
+        public string ServerAddress { get; set; }
+        public byte[] ClientPairs { get; set; }
+        public byte[] ServerPairs { get; set; }
+        public bool ClientOnly { get; set; }
+    }
+
+    public sealed class CaptureCsvEnrichmentSummary
+    {
+        public long TotalRows { get; internal set; }
+        public long MatchedRows { get; internal set; }
+        public long ClientOnlyRows { get; internal set; }
+        public long UnmatchedRows { get; internal set; }
+        public long NotSentRows { get; internal set; }
+        public long TcpFallbackRows { get; internal set; }
+        public string DirectionalDeltaMethod { get; internal set; }
+    }
+
+    internal sealed class MatchedCaptureTransaction
+    {
+        internal CapturePair Local;
+        internal CapturePair Remote;
+        internal double ClientWireMs;
+        internal double ServerTurnaroundMs;
+        internal double NetworkRemainderMs;
+        internal long BaselineClientRequestMicroseconds;
+        internal double BaselineNetworkRemainderMs;
+        internal double OutboundDelayDeltaMs;
+        internal double ReturnDelayDeltaMs;
+    }
+
+    internal static class CaptureCorrelation
+    {
+        internal const string DirectionalDeltaMethod =
+            "Same-endpoint actual P10 combined-network transaction in a nearby approximately 11-second window; directional values are deltas, not absolute one-way latency";
+
+        internal static List<MatchedCaptureTransaction> Match(byte[] localData,
+            byte[] serverData, out int localCount, out int serverCount)
+        {
+            CapturePair[] local = CaptureCodec.Decode(localData);
+            CapturePair[] remote = CaptureCodec.Decode(serverData);
+            localCount = local.Length;
+            serverCount = remote.Length;
+            Dictionary<ulong, CapturePair> remoteByKey =
+                new Dictionary<ulong, CapturePair>();
+            for (int i = 0; i < remote.Length; i++)
+                remoteByKey[Key(remote[i])] = remote[i];
+
+            List<MatchedCaptureTransaction> matched =
+                new List<MatchedCaptureTransaction>();
+            for (int i = 0; i < local.Length; i++)
+            {
+                CapturePair serverPair;
+                if (!remoteByKey.TryGetValue(Key(local[i]), out serverPair)) continue;
+                double wire = (local[i].ResponseMicroseconds -
+                    local[i].RequestMicroseconds) / 1000.0;
+                double turn = (serverPair.ResponseMicroseconds -
+                    serverPair.RequestMicroseconds) / 1000.0;
+                matched.Add(new MatchedCaptureTransaction
+                {
+                    Local = local[i],
+                    Remote = serverPair,
+                    ClientWireMs = wire,
+                    ServerTurnaroundMs = turn,
+                    NetworkRemainderMs = wire - turn
+                });
+            }
+            matched.Sort(delegate(MatchedCaptureTransaction x,
+                MatchedCaptureTransaction y)
+            {
+                return x.Local.RequestMicroseconds.CompareTo(
+                    y.Local.RequestMicroseconds);
+            });
+            ApplyDirectionalBaselines(matched);
+            return matched;
+        }
+
+        private static void ApplyDirectionalBaselines(
+            List<MatchedCaptureTransaction> transactions)
+        {
+            if (transactions.Count == 0) return;
+            const long oneSecond = 1000000L;
+            const long radius = 5000000L;
+            int bucketFirst = 0;
+            int left = 0;
+            int right = 0;
+            while (bucketFirst < transactions.Count)
+            {
+                long bucketNumber = transactions[bucketFirst].Local.RequestMicroseconds /
+                    oneSecond;
+                long bucketStart = bucketNumber * oneSecond;
+                long bucketEnd = bucketStart + oneSecond;
+                int bucketLast = bucketFirst + 1;
+                while (bucketLast < transactions.Count &&
+                    transactions[bucketLast].Local.RequestMicroseconds < bucketEnd)
+                    bucketLast++;
+
+                long windowStart = bucketStart - radius;
+                long windowEnd = bucketEnd + radius;
+                while (left < transactions.Count &&
+                    transactions[left].Local.RequestMicroseconds < windowStart) left++;
+                if (right < left) right = left;
+                while (right < transactions.Count &&
+                    transactions[right].Local.RequestMicroseconds < windowEnd) right++;
+
+                List<MatchedCaptureTransaction> candidates =
+                    new List<MatchedCaptureTransaction>();
+                for (int i = left; i < right; i++)
+                    if (transactions[i].NetworkRemainderMs >= 0.0)
+                        candidates.Add(transactions[i]);
+                if (candidates.Count == 0)
+                    for (int i = left; i < right; i++) candidates.Add(transactions[i]);
+
+                candidates.Sort(delegate(MatchedCaptureTransaction x,
+                    MatchedCaptureTransaction y)
+                {
+                    int value = x.NetworkRemainderMs.CompareTo(y.NetworkRemainderMs);
+                    if (value != 0) return value;
+                    return x.Local.RequestMicroseconds.CompareTo(
+                        y.Local.RequestMicroseconds);
+                });
+                MatchedCaptureTransaction baseline = candidates[
+                    (int)Math.Floor((candidates.Count - 1) * 0.10)];
+                double baselineOutbound = baseline.Remote.RequestMicroseconds -
+                    baseline.Local.RequestMicroseconds;
+                double baselineReturn = baseline.Local.ResponseMicroseconds -
+                    baseline.Remote.ResponseMicroseconds;
+                for (int i = bucketFirst; i < bucketLast; i++)
+                {
+                    MatchedCaptureTransaction item = transactions[i];
+                    item.BaselineClientRequestMicroseconds =
+                        baseline.Local.RequestMicroseconds;
+                    item.BaselineNetworkRemainderMs = baseline.NetworkRemainderMs;
+                    item.OutboundDelayDeltaMs = ((item.Remote.RequestMicroseconds -
+                        item.Local.RequestMicroseconds) - baselineOutbound) / 1000.0;
+                    item.ReturnDelayDeltaMs = ((item.Local.ResponseMicroseconds -
+                        item.Remote.ResponseMicroseconds) - baselineReturn) / 1000.0;
+                }
+                bucketFirst = bucketLast;
+            }
+        }
+
+        internal static ulong Key(CapturePair pair)
+        {
+            return ((ulong)pair.ClientPort << 48) |
+                ((ulong)pair.TransactionId << 32) | pair.Occurrence;
+        }
+    }
+
+    public sealed class CaptureSession : IDisposable
+    {
+        private const int EthernetDataLink = 1;
+        private readonly IntPtr handle;
+        private readonly int maximumPackets;
+        private readonly Dictionary<CaptureKey, Queue<PendingCapture>> pending =
+            new Dictionary<CaptureKey, Queue<PendingCapture>>();
+        private readonly Dictionary<CaptureKey, uint> occurrences =
+            new Dictionary<CaptureKey, uint>();
+        private readonly List<CapturePair> pairs = new List<CapturePair>();
+        private bool disposed;
+        private volatile bool stopRequested;
+
+        public CaptureReadyInfo ReadyInfo { get; private set; }
+
+        internal CaptureSession(IntPtr handle, int maximumPackets, CaptureReadyInfo readyInfo)
+        {
+            this.handle = handle;
+            this.maximumPackets = maximumPackets;
+            ReadyInfo = readyInfo;
+        }
+
+        public Task<CaptureResult> RunAsync(int durationSeconds)
+        {
+            return Task.Factory.StartNew(() => Run(durationSeconds),
+                System.Threading.CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+        }
+
+        public CaptureResult Run(int durationSeconds)
+        {
+            if (disposed) throw new ObjectDisposedException("CaptureSession");
+            DateTime startUtc = DateTime.UtcNow;
+            Stopwatch timer = Stopwatch.StartNew();
+            long parsedPackets = 0;
+            long queries = 0;
+            long responses = 0;
+            long unmatchedResponses = 0;
+            bool packetLimit = false;
+
+            while (!stopRequested && timer.Elapsed.TotalSeconds < durationSeconds)
+            {
+                IntPtr headerPointer;
+                IntPtr packetPointer;
+                int status = PcapNative.pcap_next_ex(handle, out headerPointer, out packetPointer);
+                if (status == 0) continue;
+                if (status == -2) break;
+                if (status < 0) throw new IOException(PcapNative.Error(handle));
+
+                PcapPacketHeader header = (PcapPacketHeader)Marshal.PtrToStructure(
+                    headerPointer, typeof(PcapPacketHeader));
+                int length = checked((int)header.CapturedLength);
+                if (length <= 0) continue;
+                byte[] packet = new byte[length];
+                Marshal.Copy(packetPointer, packet, 0, length);
+                ParsedDnsPacket parsed;
+                if (!TryParseDnsPacket(packet, out parsed)) continue;
+                parsedPackets++;
+                long timestamp = ((long)header.Timestamp.Seconds * 1000000L) +
+                    header.Timestamp.Microseconds;
+                CaptureKey key = new CaptureKey(parsed.ClientPort, parsed.TransactionId);
+                if (parsed.IsResponse)
+                {
+                    responses++;
+                    Queue<PendingCapture> queue;
+                    if (pending.TryGetValue(key, out queue) && queue.Count > 0)
+                    {
+                        PendingCapture request = queue.Dequeue();
+                        if (queue.Count == 0) pending.Remove(key);
+                        pairs.Add(new CapturePair
+                        {
+                            ClientPort = key.ClientPort,
+                            TransactionId = key.TransactionId,
+                            Occurrence = request.Occurrence,
+                            RequestMicroseconds = request.RequestMicroseconds,
+                            ResponseMicroseconds = timestamp
+                        });
+                    }
+                    else unmatchedResponses++;
+                }
+                else
+                {
+                    queries++;
+                    uint occurrence;
+                    if (!occurrences.TryGetValue(key, out occurrence)) occurrence = 0;
+                    occurrence++;
+                    occurrences[key] = occurrence;
+                    Queue<PendingCapture> queue;
+                    if (!pending.TryGetValue(key, out queue))
+                    {
+                        queue = new Queue<PendingCapture>();
+                        pending.Add(key, queue);
+                    }
+                    queue.Enqueue(new PendingCapture
+                    {
+                        Occurrence = occurrence,
+                        RequestMicroseconds = timestamp
+                    });
+                }
+
+                if (parsedPackets >= maximumPackets)
+                {
+                    packetLimit = true;
+                    break;
+                }
+            }
+
+            timer.Stop();
+            long unmatchedQueries = 0;
+            foreach (Queue<PendingCapture> queue in pending.Values)
+                unmatchedQueries += queue.Count;
+
+            PcapStatisticsNative statistics;
+            bool statisticsAvailable = PcapNative.pcap_stats(handle, out statistics) == 0;
+            return new CaptureResult
+            {
+                ComputerName = ReadyInfo.ComputerName,
+                LocalAddress = ReadyInfo.LocalAddress,
+                PeerAddress = ReadyInfo.PeerAddress,
+                AdapterName = ReadyInfo.AdapterName,
+                DeviceName = ReadyInfo.DeviceName,
+                Filter = ReadyInfo.Filter,
+                NpcapVersion = ReadyInfo.NpcapVersion,
+                TimestampSource = ReadyInfo.TimestampSource,
+                CaptureStartUtc = startUtc,
+                CaptureEndUtc = DateTime.UtcNow,
+                ParsedPackets = parsedPackets,
+                QueryPackets = queries,
+                ResponsePackets = responses,
+                CompletedPairs = pairs.Count,
+                UnmatchedQueries = unmatchedQueries,
+                UnmatchedResponses = unmatchedResponses,
+                PcapReceived = statisticsAvailable ? statistics.Received : 0,
+                PcapDropped = statisticsAvailable ? statistics.Dropped : 0,
+                InterfaceDropped = statisticsAvailable ? statistics.InterfaceDropped : 0,
+                StatisticsAvailable = statisticsAvailable,
+                PacketLimitReached = packetLimit,
+                CompressedPairs = CaptureCodec.Encode(pairs)
+            };
+        }
+
+        private struct ParsedDnsPacket
+        {
+            internal ushort ClientPort;
+            internal ushort TransactionId;
+            internal bool IsResponse;
+        }
+
+        private static bool TryParseDnsPacket(byte[] packet, out ParsedDnsPacket parsed)
+        {
+            parsed = new ParsedDnsPacket();
+            if (packet == null || packet.Length < 54) return false;
+            int offset = 14;
+            ushort etherType = ReadUInt16(packet, 12);
+            while ((etherType == 0x8100 || etherType == 0x88a8) && packet.Length >= offset + 4)
+            {
+                etherType = ReadUInt16(packet, offset + 2);
+                offset += 4;
+            }
+
+            int udpOffset;
+            if (etherType == 0x0800)
+            {
+                if (packet.Length < offset + 20 || (packet[offset] >> 4) != 4) return false;
+                int ipHeaderLength = (packet[offset] & 15) * 4;
+                if (ipHeaderLength < 20 || packet.Length < offset + ipHeaderLength + 8) return false;
+                if (packet[offset + 9] != 17) return false;
+                udpOffset = offset + ipHeaderLength;
+            }
+            else if (etherType == 0x86dd)
+            {
+                if (packet.Length < offset + 40 + 8 || (packet[offset] >> 4) != 6) return false;
+                if (packet[offset + 6] != 17) return false;
+                udpOffset = offset + 40;
+            }
+            else return false;
+
+            if (packet.Length < udpOffset + 20) return false;
+            ushort sourcePort = ReadUInt16(packet, udpOffset);
+            ushort destinationPort = ReadUInt16(packet, udpOffset + 2);
+            if (sourcePort != 53 && destinationPort != 53) return false;
+            int dnsOffset = udpOffset + 8;
+            ushort flags = ReadUInt16(packet, dnsOffset + 2);
+            bool response = (flags & 0x8000) != 0;
+            if ((!response && destinationPort != 53) || (response && sourcePort != 53)) return false;
+            parsed.ClientPort = response ? destinationPort : sourcePort;
+            parsed.TransactionId = ReadUInt16(packet, dnsOffset);
+            parsed.IsResponse = response;
+            return true;
+        }
+
+        private static ushort ReadUInt16(byte[] value, int offset)
+        {
+            return (ushort)((value[offset] << 8) | value[offset + 1]);
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            if (handle != IntPtr.Zero) PcapNative.pcap_close(handle);
+        }
+
+        public void RequestStop()
+        {
+            stopRequested = true;
+        }
+    }
+
+    public static class CaptureRunner
+    {
+        public static CaptureSession Open(string localAddress, string peerAddress,
+            int snapshotLength, int bufferMegabytes, int maximumPackets)
+        {
+            IPAddress local;
+            IPAddress peer;
+            if (!IPAddress.TryParse(localAddress, out local))
+                throw new ArgumentException("The local capture address is invalid.", "localAddress");
+            if (!IPAddress.TryParse(peerAddress, out peer))
+                throw new ArgumentException("The peer capture address is invalid.", "peerAddress");
+            if (local.AddressFamily != peer.AddressFamily)
+                throw new ArgumentException("Local and peer capture addresses must use the same address family.");
+
+            NetworkInterface selected = null;
+            foreach (NetworkInterface adapter in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                foreach (UnicastIPAddressInformation address in
+                    adapter.GetIPProperties().UnicastAddresses)
+                {
+                    if (address.Address.Equals(local))
+                    {
+                        selected = adapter;
+                        break;
+                    }
+                }
+                if (selected != null) break;
+            }
+            if (selected == null)
+                throw new InvalidOperationException("No local network adapter owns " + localAddress + ".");
+
+            string id = selected.Id;
+            if (!id.StartsWith("{", StringComparison.Ordinal)) id = "{" + id + "}";
+            string deviceName = "\\Device\\NPF_" + id;
+            string family = local.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ?
+                "ip" : "ip6";
+            string filter = family + " and udp and port 53 and host " +
+                localAddress + " and host " + peerAddress;
+            StringBuilder error = new StringBuilder(PcapNative.ErrorBufferSize);
+            IntPtr handle = PcapNative.pcap_create(deviceName, error);
+            if (handle == IntPtr.Zero)
+                throw new InvalidOperationException("Npcap could not open " + deviceName + ": " + error);
+
+            try
+            {
+                if (PcapNative.pcap_set_snaplen(handle, snapshotLength) != 0)
+                    throw new InvalidOperationException(PcapNative.Error(handle));
+                if (PcapNative.pcap_set_promisc(handle, 0) != 0)
+                    throw new InvalidOperationException(PcapNative.Error(handle));
+                if (PcapNative.pcap_set_timeout(handle, 100) != 0)
+                    throw new InvalidOperationException(PcapNative.Error(handle));
+                if (PcapNative.pcap_set_buffer_size(handle,
+                    checked(bufferMegabytes * 1024 * 1024)) != 0)
+                    throw new InvalidOperationException(PcapNative.Error(handle));
+                int activation = PcapNative.pcap_activate(handle);
+                if (activation < 0)
+                    throw new InvalidOperationException("Npcap activation failed: " +
+                        PcapNative.Error(handle));
+                if (PcapNative.pcap_datalink(handle) != EthernetDataLink)
+                    throw new NotSupportedException("Coordinated capture currently requires an Ethernet Npcap data link.");
+
+                BpfProgram program;
+                if (PcapNative.pcap_compile(handle, out program, filter, 1, 0xffffffff) != 0)
+                    throw new InvalidOperationException("Npcap filter compilation failed: " +
+                        PcapNative.Error(handle));
+                try
+                {
+                    if (PcapNative.pcap_setfilter(handle, ref program) != 0)
+                        throw new InvalidOperationException("Npcap filter activation failed: " +
+                            PcapNative.Error(handle));
+                }
+                finally { PcapNative.pcap_freecode(ref program); }
+
+                CaptureReadyInfo ready = new CaptureReadyInfo
+                {
+                    ComputerName = Environment.MachineName,
+                    LocalAddress = localAddress,
+                    PeerAddress = peerAddress,
+                    AdapterName = selected.Name,
+                    DeviceName = deviceName,
+                    Filter = filter,
+                    NpcapVersion = PcapNative.Version(),
+                    TimestampSource = "Npcap default host timestamp (microsecond representation)"
+                };
+                return new CaptureSession(handle, maximumPackets, ready);
+            }
+            catch
+            {
+                PcapNative.pcap_close(handle);
+                throw;
+            }
+        }
+
+        private const int EthernetDataLink = 1;
+    }
+
+    internal static class CaptureCodec
+    {
+        private const int Magic = 0x44504331;
+
+        internal static byte[] Encode(List<CapturePair> pairs)
+        {
+            using (MemoryStream output = new MemoryStream())
+            {
+                using (GZipStream gzip = new GZipStream(output, CompressionMode.Compress, true))
+                using (BinaryWriter writer = new BinaryWriter(gzip, Encoding.UTF8, true))
+                {
+                    writer.Write(Magic);
+                    writer.Write(1);
+                    writer.Write(pairs.Count);
+                    for (int i = 0; i < pairs.Count; i++)
+                    {
+                        CapturePair pair = pairs[i];
+                        writer.Write(pair.ClientPort);
+                        writer.Write(pair.TransactionId);
+                        writer.Write(pair.Occurrence);
+                        writer.Write(pair.RequestMicroseconds);
+                        writer.Write(pair.ResponseMicroseconds);
+                    }
+                }
+                return output.ToArray();
+            }
+        }
+
+        internal static CapturePair[] Decode(byte[] compressed)
+        {
+            if (compressed == null || compressed.Length == 0) return new CapturePair[0];
+            using (MemoryStream input = new MemoryStream(compressed, false))
+            using (GZipStream gzip = new GZipStream(input, CompressionMode.Decompress))
+            using (BinaryReader reader = new BinaryReader(gzip, Encoding.UTF8))
+            {
+                if (reader.ReadInt32() != Magic) throw new InvalidDataException("Invalid coordinated capture data.");
+                if (reader.ReadInt32() != 1) throw new InvalidDataException("Unsupported coordinated capture data version.");
+                int count = reader.ReadInt32();
+                if (count < 0 || count > 100000000) throw new InvalidDataException("Invalid coordinated capture pair count.");
+                CapturePair[] pairs = new CapturePair[count];
+                for (int i = 0; i < count; i++)
+                {
+                    pairs[i] = new CapturePair
+                    {
+                        ClientPort = reader.ReadUInt16(),
+                        TransactionId = reader.ReadUInt16(),
+                        Occurrence = reader.ReadUInt32(),
+                        RequestMicroseconds = reader.ReadInt64(),
+                        ResponseMicroseconds = reader.ReadInt64()
+                    };
+                }
+                return pairs;
+            }
+        }
+    }
+
+    internal struct CaptureCsvKey : IEquatable<CaptureCsvKey>
+    {
+        internal string ServerAddress;
+        internal ushort ClientPort;
+        internal ushort TransactionId;
+        internal uint Occurrence;
+
+        public bool Equals(CaptureCsvKey other)
+        {
+            return String.Equals(ServerAddress, other.ServerAddress,
+                StringComparison.OrdinalIgnoreCase) && ClientPort == other.ClientPort &&
+                TransactionId == other.TransactionId && Occurrence == other.Occurrence;
+        }
+
+        public override bool Equals(object value)
+        {
+            return value is CaptureCsvKey && Equals((CaptureCsvKey)value);
+        }
+
+        public override int GetHashCode()
+        {
+            return StringComparer.OrdinalIgnoreCase.GetHashCode(ServerAddress ?? "") ^
+                (ClientPort << 16) ^ TransactionId ^ unchecked((int)Occurrence);
+        }
+    }
+
+    internal struct CaptureCsvLooseKey : IEquatable<CaptureCsvLooseKey>
+    {
+        internal string ServerAddress;
+        internal ushort ClientPort;
+        internal ushort TransactionId;
+
+        public bool Equals(CaptureCsvLooseKey other)
+        {
+            return String.Equals(ServerAddress, other.ServerAddress,
+                StringComparison.OrdinalIgnoreCase) && ClientPort == other.ClientPort &&
+                TransactionId == other.TransactionId;
+        }
+
+        public override bool Equals(object value)
+        {
+            return value is CaptureCsvLooseKey && Equals((CaptureCsvLooseKey)value);
+        }
+
+        public override int GetHashCode()
+        {
+            return StringComparer.OrdinalIgnoreCase.GetHashCode(ServerAddress ?? "") ^
+                (ClientPort << 16) ^ TransactionId;
+        }
+    }
+
+    public static class CaptureCsvEnricher
+    {
+        private const long CorrelationToleranceTicks = TimeSpan.TicksPerSecond;
+
+        public static CaptureCsvEnrichmentSummary Enrich(string csvPath,
+            CaptureCsvEndpoint[] endpoints)
+        {
+            if (String.IsNullOrEmpty(csvPath))
+                throw new ArgumentException("The CSV path is required.", "csvPath");
+            if (endpoints == null) throw new ArgumentNullException("endpoints");
+
+            Dictionary<CaptureCsvKey, MatchedCaptureTransaction> exact =
+                new Dictionary<CaptureCsvKey, MatchedCaptureTransaction>();
+            Dictionary<CaptureCsvLooseKey, List<MatchedCaptureTransaction>> loose =
+                new Dictionary<CaptureCsvLooseKey, List<MatchedCaptureTransaction>>();
+            HashSet<string> clientOnlyAddresses = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+            for (int endpointIndex = 0; endpointIndex < endpoints.Length;
+                endpointIndex++)
+            {
+                CaptureCsvEndpoint endpoint = endpoints[endpointIndex];
+                if (endpoint == null || String.IsNullOrEmpty(endpoint.ServerAddress))
+                    continue;
+                if (endpoint.ClientOnly)
+                {
+                    clientOnlyAddresses.Add(endpoint.ServerAddress);
+                    continue;
+                }
+                int ignoredLocal;
+                int ignoredServer;
+                List<MatchedCaptureTransaction> matches = CaptureCorrelation.Match(
+                    endpoint.ClientPairs, endpoint.ServerPairs, out ignoredLocal,
+                    out ignoredServer);
+                for (int i = 0; i < matches.Count; i++)
+                {
+                    MatchedCaptureTransaction item = matches[i];
+                    CaptureCsvKey key = new CaptureCsvKey
+                    {
+                        ServerAddress = endpoint.ServerAddress,
+                        ClientPort = item.Local.ClientPort,
+                        TransactionId = item.Local.TransactionId,
+                        Occurrence = item.Local.Occurrence
+                    };
+                    exact[key] = item;
+                    CaptureCsvLooseKey looseKey = new CaptureCsvLooseKey
+                    {
+                        ServerAddress = endpoint.ServerAddress,
+                        ClientPort = item.Local.ClientPort,
+                        TransactionId = item.Local.TransactionId
+                    };
+                    List<MatchedCaptureTransaction> candidates;
+                    if (!loose.TryGetValue(looseKey, out candidates))
+                    {
+                        candidates = new List<MatchedCaptureTransaction>();
+                        loose.Add(looseKey, candidates);
+                    }
+                    candidates.Add(item);
+                }
+            }
+
+            CaptureCsvEnrichmentSummary summary = new CaptureCsvEnrichmentSummary
+            {
+                DirectionalDeltaMethod = CaptureCorrelation.DirectionalDeltaMethod
+            };
+            HashSet<MatchedCaptureTransaction> used =
+                new HashSet<MatchedCaptureTransaction>();
+            string temporaryPath = csvPath + ".npcap." +
+                Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (StreamReader reader = new StreamReader(csvPath, true))
+                using (StreamWriter writer = new StreamWriter(temporaryPath, false,
+                    new UTF8Encoding(true), 65536))
+                {
+                    string headerRecord = ReadCsvRecord(reader);
+                    if (headerRecord == null)
+                        throw new InvalidDataException("The detailed CSV is empty.");
+                    string[] headers = ParseCsvRecord(headerRecord);
+                    int serverAddressIndex = HeaderIndex(headers, "ServerAddress");
+                    int startedUtcIndex = HeaderIndex(headers, "StartedUtc");
+                    int clientPortIndex = HeaderIndex(headers, "ClientPort");
+                    int transactionIdIndex = HeaderIndex(headers, "TransactionId");
+                    int occurrenceIndex = HeaderIndex(headers, "CaptureOccurrence");
+                    int sentIndex = HeaderIndex(headers, "Sent");
+                    int tcpFallbackIndex = HeaderIndex(headers, "TcpFallbackUsed");
+                    writer.WriteLine(headerRecord +
+                        ",PacketTimingStatus,PacketTimingSource,ClientPacketRequestUtc," +
+                        "ServerPacketReceiveUtc,ServerPacketSendUtc,ClientPacketResponseUtc," +
+                        "ClientPacketObservedLatencyMs,ServerPacketTurnaroundMs," +
+                        "CombinedNetworkTimeMs,DirectionalBaselineUtc," +
+                        "DirectionalBaselineCombinedNetworkMs,OutboundDelayDeltaMs," +
+                        "ReturnDelayDeltaMs");
+
+                    string record;
+                    while ((record = ReadCsvRecord(reader)) != null)
+                    {
+                        if (record.Length == 0) continue;
+                        summary.TotalRows++;
+                        string[] fields = ParseCsvRecord(record);
+                        bool sent = BooleanField(fields, sentIndex);
+                        bool tcpFallback = BooleanField(fields, tcpFallbackIndex);
+                        if (!sent)
+                        {
+                            summary.NotSentRows++;
+                            writer.WriteLine(record + EmptyEvidence("NotSent"));
+                            continue;
+                        }
+                        if (tcpFallback)
+                        {
+                            summary.TcpFallbackRows++;
+                            writer.WriteLine(record + EmptyEvidence(
+                                "TcpFallbackExcluded"));
+                            continue;
+                        }
+
+                        ushort clientPort;
+                        ushort transactionId;
+                        uint occurrence;
+                        DateTime startedUtc;
+                        if (!UInt16.TryParse(Field(fields, clientPortIndex),
+                                NumberStyles.Integer, CultureInfo.InvariantCulture,
+                                out clientPort) ||
+                            !UInt16.TryParse(Field(fields, transactionIdIndex),
+                                NumberStyles.Integer, CultureInfo.InvariantCulture,
+                                out transactionId) ||
+                            !UInt32.TryParse(Field(fields, occurrenceIndex),
+                                NumberStyles.Integer, CultureInfo.InvariantCulture,
+                                out occurrence) ||
+                            !DateTime.TryParse(Field(fields, startedUtcIndex),
+                                CultureInfo.InvariantCulture,
+                                DateTimeStyles.RoundtripKind, out startedUtc))
+                        {
+                            summary.UnmatchedRows++;
+                            writer.WriteLine(record + EmptyEvidence(
+                                "CorrelationKeyUnavailable"));
+                            continue;
+                        }
+
+                        string serverAddress = Field(fields, serverAddressIndex);
+                        MatchedCaptureTransaction match = FindMatch(exact, loose, used,
+                            serverAddress, clientPort, transactionId, occurrence,
+                            startedUtc.ToUniversalTime().Ticks);
+                        if (match == null)
+                        {
+                            if (clientOnlyAddresses.Contains(serverAddress))
+                            {
+                                summary.ClientOnlyRows++;
+                                writer.WriteLine(record + EmptyEvidence(
+                                    "ClientOnly", "UdpSocketReceive"));
+                                continue;
+                            }
+                            summary.UnmatchedRows++;
+                            writer.WriteLine(record + EmptyEvidence(
+                                "NoMatchedCapturePair"));
+                            continue;
+                        }
+
+                        used.Add(match);
+                        summary.MatchedRows++;
+                        writer.WriteLine(record + Evidence(match));
+                    }
+                }
+                File.Replace(temporaryPath, csvPath, null);
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath))
+                    try { File.Delete(temporaryPath); }
+                    catch { }
+            }
+            return summary;
+        }
+
+        private static MatchedCaptureTransaction FindMatch(
+            Dictionary<CaptureCsvKey, MatchedCaptureTransaction> exact,
+            Dictionary<CaptureCsvLooseKey, List<MatchedCaptureTransaction>> loose,
+            HashSet<MatchedCaptureTransaction> used, string serverAddress,
+            ushort clientPort, ushort transactionId, uint occurrence,
+            long startedUtcTicks)
+        {
+            CaptureCsvKey exactKey = new CaptureCsvKey
+            {
+                ServerAddress = serverAddress,
+                ClientPort = clientPort,
+                TransactionId = transactionId,
+                Occurrence = occurrence
+            };
+            MatchedCaptureTransaction value;
+            if (exact.TryGetValue(exactKey, out value) && !used.Contains(value) &&
+                Math.Abs(ToUtcTicks(value.Local.RequestMicroseconds) -
+                    startedUtcTicks) <= CorrelationToleranceTicks)
+                return value;
+
+            CaptureCsvLooseKey looseKey = new CaptureCsvLooseKey
+            {
+                ServerAddress = serverAddress,
+                ClientPort = clientPort,
+                TransactionId = transactionId
+            };
+            List<MatchedCaptureTransaction> candidates;
+            if (!loose.TryGetValue(looseKey, out candidates)) return null;
+            MatchedCaptureTransaction best = null;
+            long bestDistance = Int64.MaxValue;
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                if (used.Contains(candidates[i])) continue;
+                long distance = Math.Abs(ToUtcTicks(
+                    candidates[i].Local.RequestMicroseconds) - startedUtcTicks);
+                if (distance < bestDistance)
+                {
+                    best = candidates[i];
+                    bestDistance = distance;
+                }
+            }
+            return bestDistance <= CorrelationToleranceTicks ? best : null;
+        }
+
+        private static string Evidence(MatchedCaptureTransaction item)
+        {
+            return ",\"Matched\",\"Npcap\"," +
+                CsvDate(item.Local.RequestMicroseconds) + "," +
+                CsvDate(item.Remote.RequestMicroseconds) + "," +
+                CsvDate(item.Remote.ResponseMicroseconds) + "," +
+                CsvDate(item.Local.ResponseMicroseconds) + "," +
+                Number(item.ClientWireMs) + "," +
+                Number(item.ServerTurnaroundMs) + "," +
+                Number(item.NetworkRemainderMs) + "," +
+                CsvDate(item.BaselineClientRequestMicroseconds) + "," +
+                Number(item.BaselineNetworkRemainderMs) + "," +
+                Number(item.OutboundDelayDeltaMs) + "," +
+                Number(item.ReturnDelayDeltaMs);
+        }
+
+        private static string EmptyEvidence(string status)
+        {
+            return EmptyEvidence(status, "Npcap");
+        }
+
+        private static string EmptyEvidence(string status, string source)
+        {
+            return ",\"" + status.Replace("\"", "\"\"") +
+                "\",\"" + source.Replace("\"", "\"\"") +
+                "\",,,,,,,,,,,";
+        }
+
+        private static string CsvDate(long microseconds)
+        {
+            return "\"" + UnixMicrosecondsToUtc(microseconds).ToString("o",
+                CultureInfo.InvariantCulture) + "\"";
+        }
+
+        private static string Number(double value)
+        {
+            return Math.Round(value, 3).ToString("0.000",
+                CultureInfo.InvariantCulture);
+        }
+
+        private static long ToUtcTicks(long microseconds)
+        {
+            return UnixMicrosecondsToUtc(microseconds).Ticks;
+        }
+
+        private static DateTime UnixMicrosecondsToUtc(long value)
+        {
+            return new DateTime(1970, 1, 1, 0, 0, 0,
+                DateTimeKind.Utc).AddTicks(value * 10L);
+        }
+
+        private static int HeaderIndex(string[] headers, string name)
+        {
+            for (int i = 0; i < headers.Length; i++)
+                if (String.Equals(headers[i], name, StringComparison.Ordinal)) return i;
+            throw new InvalidDataException("The detailed CSV is missing " + name + ".");
+        }
+
+        private static string Field(string[] fields, int index)
+        {
+            return index >= 0 && index < fields.Length ? fields[index] : "";
+        }
+
+        private static bool BooleanField(string[] fields, int index)
+        {
+            return String.Equals(Field(fields, index), "True",
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ReadCsvRecord(StreamReader reader)
+        {
+            string line = reader.ReadLine();
+            if (line == null) return null;
+            StringBuilder record = new StringBuilder(line);
+            bool quoted = QuoteState(line, false);
+            while (quoted)
+            {
+                line = reader.ReadLine();
+                if (line == null)
+                    throw new InvalidDataException("The detailed CSV ends inside a quoted field.");
+                record.Append("\r\n");
+                record.Append(line);
+                quoted = QuoteState(line, quoted);
+            }
+            return record.ToString();
+        }
+
+        private static bool QuoteState(string value, bool quoted)
+        {
+            for (int i = 0; i < value.Length; i++)
+            {
+                if (value[i] != '\"') continue;
+                if (quoted && i + 1 < value.Length && value[i + 1] == '\"')
+                {
+                    i++;
+                    continue;
+                }
+                quoted = !quoted;
+            }
+            return quoted;
+        }
+
+        private static string[] ParseCsvRecord(string record)
+        {
+            List<string> fields = new List<string>();
+            StringBuilder field = new StringBuilder();
+            bool quoted = false;
+            for (int i = 0; i < record.Length; i++)
+            {
+                char value = record[i];
+                if (quoted)
+                {
+                    if (value == '\"')
+                    {
+                        if (i + 1 < record.Length && record[i + 1] == '\"')
+                        {
+                            field.Append('\"');
+                            i++;
+                        }
+                        else quoted = false;
+                    }
+                    else field.Append(value);
+                }
+                else if (value == '\"') quoted = true;
+                else if (value == ',')
+                {
+                    fields.Add(field.ToString());
+                    field.Clear();
+                }
+                else field.Append(value);
+            }
+            fields.Add(field.ToString());
+            return fields.ToArray();
+        }
+    }
+
+    public static class CaptureAnalyzer
+    {
+        public static CoordinatedCaptureAnalysis Analyze(string server, string serverAddress,
+            byte[] localData, byte[] serverData, double slowThresholdMilliseconds,
+            int maximumSlowTransactions)
+        {
+            int localCount;
+            int serverCount;
+            List<MatchedCaptureTransaction> matchedTransactions =
+                CaptureCorrelation.Match(localData, serverData, out localCount,
+                    out serverCount);
+
+            List<double> clientWire = new List<double>();
+            List<double> serverTurn = new List<double>();
+            List<double> networkRemainder = new List<double>();
+            List<double> outboundDelayDelta = new List<double>();
+            List<double> returnDelayDelta = new List<double>();
+            SortedSet<SlowCaptureTransaction> slow = new SortedSet<SlowCaptureTransaction>(
+                new SlowCaptureComparer());
+            long negative = 0;
+            long tie = 0;
+
+            for (int i = 0; i < matchedTransactions.Count; i++)
+            {
+                MatchedCaptureTransaction matchedItem = matchedTransactions[i];
+                double wire = matchedItem.ClientWireMs;
+                double turn = matchedItem.ServerTurnaroundMs;
+                double remainder = matchedItem.NetworkRemainderMs;
+                if (remainder < 0) negative++;
+                clientWire.Add(wire);
+                serverTurn.Add(turn);
+                networkRemainder.Add(remainder);
+                outboundDelayDelta.Add(matchedItem.OutboundDelayDeltaMs);
+                returnDelayDelta.Add(matchedItem.ReturnDelayDeltaMs);
+
+                double score = Math.Max(wire, Math.Max(turn, remainder));
+                if (maximumSlowTransactions > 0 && score >= slowThresholdMilliseconds)
+                {
+                    SlowCaptureTransaction item = new SlowCaptureTransaction
+                    {
+                        ClientRequestUtc = UnixMicrosecondsToUtc(
+                            matchedItem.Local.RequestMicroseconds),
+                        ClientResponseUtc = UnixMicrosecondsToUtc(
+                            matchedItem.Local.ResponseMicroseconds),
+                        ServerReceiveUtc = UnixMicrosecondsToUtc(
+                            matchedItem.Remote.RequestMicroseconds),
+                        ServerSendUtc = UnixMicrosecondsToUtc(
+                            matchedItem.Remote.ResponseMicroseconds),
+                        ClientPort = matchedItem.Local.ClientPort,
+                        TransactionId = matchedItem.Local.TransactionId,
+                        Occurrence = matchedItem.Local.Occurrence,
+                        ClientWireMs = Round(wire),
+                        ServerTurnaroundMs = Round(turn),
+                        NetworkRemainderMs = Round(remainder),
+                        DirectionalBaselineUtc = UnixMicrosecondsToUtc(
+                            matchedItem.BaselineClientRequestMicroseconds),
+                        DirectionalBaselineCombinedNetworkMs = Round(
+                            matchedItem.BaselineNetworkRemainderMs),
+                        OutboundDelayDeltaMs = Round(
+                            matchedItem.OutboundDelayDeltaMs),
+                        ReturnDelayDeltaMs = Round(matchedItem.ReturnDelayDeltaMs),
+                        Score = score,
+                        TieBreaker = ++tie
+                    };
+                    slow.Add(item);
+                    if (slow.Count > maximumSlowTransactions) slow.Remove(slow.Min);
+                }
+            }
+
+            SlowCaptureTransaction[] slowOutput = new SlowCaptureTransaction[slow.Count];
+            int outputIndex = slow.Count - 1;
+            foreach (SlowCaptureTransaction item in slow) slowOutput[outputIndex--] = item;
+            long matched = matchedTransactions.Count;
+            return new CoordinatedCaptureAnalysis
+            {
+                Server = server,
+                ServerAddress = serverAddress,
+                LocalPairs = localCount,
+                ServerPairs = serverCount,
+                MatchedPairs = matched,
+                UnmatchedLocalPairs = localCount - matched,
+                UnmatchedServerPairs = serverCount - matched,
+                NegativeNetworkRemainders = negative,
+                CoveragePercent = localCount > 0 ? Round(100.0 * matched / localCount) : 0.0,
+                ClientWire = Metrics(clientWire),
+                ServerTurnaround = Metrics(serverTurn),
+                NetworkRemainder = Metrics(networkRemainder),
+                OutboundDelayDelta = Metrics(outboundDelayDelta),
+                ReturnDelayDelta = Metrics(returnDelayDelta),
+                DirectionalDeltaMethod = CaptureCorrelation.DirectionalDeltaMethod,
+                SlowTransactions = slowOutput
+            };
+        }
+
+        private static CaptureMetricSummary Metrics(List<double> values)
+        {
+            CaptureMetricSummary result = new CaptureMetricSummary { Count = values.Count };
+            if (values.Count == 0) return result;
+            double sum = 0.0;
+            double mean = 0.0;
+            double m2 = 0.0;
+            for (int i = 0; i < values.Count; i++)
+            {
+                double value = values[i];
+                sum += value;
+                double delta = value - mean;
+                mean += delta / (i + 1);
+                m2 += delta * (value - mean);
+            }
+            double[] sorted = values.ToArray();
+            Array.Sort(sorted);
+            result.MinimumMs = Round(sorted[0]);
+            result.AverageMs = Round(sum / values.Count);
+            result.StandardDeviationMs = Round(values.Count > 1 ?
+                Math.Sqrt(m2 / (values.Count - 1)) : 0.0);
+            result.P50Ms = Round(Percentile(sorted, 0.50));
+            result.P95Ms = Round(Percentile(sorted, 0.95));
+            result.P99Ms = Round(Percentile(sorted, 0.99));
+            result.MaximumMs = Round(sorted[sorted.Length - 1]);
+            return result;
+        }
+
+        private static double Percentile(double[] values, double percentile)
+        {
+            if (values.Length == 1) return values[0];
+            double rank = percentile * (values.Length - 1);
+            int lower = (int)Math.Floor(rank);
+            int upper = (int)Math.Ceiling(rank);
+            if (lower == upper) return values[lower];
+            return values[lower] + (values[upper] - values[lower]) * (rank - lower);
+        }
+
+        private static DateTime UnixMicrosecondsToUtc(long value)
+        {
+            return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddTicks(value * 10L);
+        }
+
+        private static double Round(double value)
+        {
+            return Math.Round(value, 3);
+        }
+    }
+}
+'@
+
+        $forwardingCaptureTypeDefinition = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace DnsForwardingCaptureV410
+{
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ForwardBpfProgram
+    {
+        public uint Length;
+        public IntPtr Instructions;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ForwardPcapTimeval
+    {
+        public int Seconds;
+        public int Microseconds;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ForwardPcapPacketHeader
+    {
+        public ForwardPcapTimeval Timestamp;
+        public uint CapturedLength;
+        public uint OriginalLength;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ForwardPcapStatistics
+    {
+        public uint Received;
+        public uint Dropped;
+        public uint InterfaceDropped;
+        public uint Captured;
+    }
+
+    internal static class ForwardPcapNative
+    {
+        internal const int ErrorBufferSize = 512;
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl,
+            CharSet = CharSet.Ansi)]
+        internal static extern IntPtr pcap_create(string source, StringBuilder errorBuffer);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_set_snaplen(IntPtr handle, int snapshotLength);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_set_promisc(IntPtr handle, int enabled);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_set_timeout(IntPtr handle, int timeoutMilliseconds);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_set_buffer_size(IntPtr handle, int bufferBytes);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_activate(IntPtr handle);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_datalink(IntPtr handle);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl,
+            CharSet = CharSet.Ansi)]
+        internal static extern int pcap_compile(IntPtr handle, out ForwardBpfProgram program,
+            string filter, int optimize, uint networkMask);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_setfilter(IntPtr handle, ref ForwardBpfProgram program);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void pcap_freecode(ref ForwardBpfProgram program);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_next_ex(IntPtr handle, out IntPtr header,
+            out IntPtr packetData);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pcap_stats(IntPtr handle, out ForwardPcapStatistics statistics);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr pcap_geterr(IntPtr handle);
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr pcap_lib_version();
+
+        [DllImport("wpcap.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void pcap_close(IntPtr handle);
+
+        internal static string Error(IntPtr handle)
+        {
+            IntPtr value = handle == IntPtr.Zero ? IntPtr.Zero : pcap_geterr(handle);
+            return value == IntPtr.Zero ? "Unknown Npcap error." : Marshal.PtrToStringAnsi(value);
+        }
+
+        internal static string Version()
+        {
+            IntPtr value = pcap_lib_version();
+            return value == IntPtr.Zero ? "Unknown" : Marshal.PtrToStringAnsi(value);
+        }
+    }
+
+    internal static class ForwardTraceKind
+    {
+        internal const byte ClientQuery = 1;
+        internal const byte ClientResponse = 2;
+        internal const byte ForwardQuery = 3;
+        internal const byte ForwardResponse = 4;
+    }
+
+    internal struct ForwardTraceEvent
+    {
+        internal long TimestampMicroseconds;
+        internal byte Kind;
+        internal bool Tcp;
+        internal bool Truncated;
+        internal ushort LocalPort;
+        internal ushort TransactionId;
+        internal ushort PeerIndex;
+        internal int NameIndex;
+        internal ushort QueryType;
+        internal byte ResponseCode;
+    }
+
+    public sealed class ForwardingCaptureReadyInfo
+    {
+        public string ComputerName { get; internal set; }
+        public string LocalAddress { get; internal set; }
+        public string ClientAddress { get; internal set; }
+        public string[] ForwardingLocalAddresses { get; internal set; }
+        public string[] MasterAddresses { get; internal set; }
+        public string AdapterName { get; internal set; }
+        public string DeviceName { get; internal set; }
+        public string Filter { get; internal set; }
+        public string NpcapVersion { get; internal set; }
+        public string TimestampSource { get; internal set; }
+    }
+
+    public sealed class ForwardingCaptureResult
+    {
+        public string ComputerName { get; internal set; }
+        public string LocalAddress { get; internal set; }
+        public string ClientAddress { get; internal set; }
+        public string[] ForwardingLocalAddresses { get; internal set; }
+        public string[] MasterAddresses { get; internal set; }
+        public string AdapterName { get; internal set; }
+        public string DeviceName { get; internal set; }
+        public string Filter { get; internal set; }
+        public string NpcapVersion { get; internal set; }
+        public string TimestampSource { get; internal set; }
+        public DateTime CaptureStartUtc { get; internal set; }
+        public DateTime CaptureEndUtc { get; internal set; }
+        public long CapturedPackets { get; internal set; }
+        public long ParsedDnsPackets { get; internal set; }
+        public long RelevantEvents { get; internal set; }
+        public long UnparsedDnsPackets { get; internal set; }
+        public long PcapReceived { get; internal set; }
+        public long PcapDropped { get; internal set; }
+        public long InterfaceDropped { get; internal set; }
+        public bool StatisticsAvailable { get; internal set; }
+        public bool PacketLimitReached { get; internal set; }
+        public byte[] CompressedEvents { get; internal set; }
+    }
+
+    internal sealed class ParsedForwardDnsPacket
+    {
+        internal byte[] SourceAddress;
+        internal byte[] DestinationAddress;
+        internal ushort SourcePort;
+        internal ushort DestinationPort;
+        internal ushort TransactionId;
+        internal string QueryName;
+        internal ushort QueryType;
+        internal bool IsResponse;
+        internal bool Tcp;
+        internal bool Truncated;
+        internal byte ResponseCode;
+    }
+
+    public sealed class ForwardingCaptureSession : IDisposable
+    {
+        private readonly IntPtr handle;
+        private readonly int maximumPackets;
+        private readonly byte[] serviceAddressBytes;
+        private readonly byte[][] forwardingLocalAddressBytes;
+        private readonly byte[] clientAddressBytes;
+        private readonly byte[][] masterAddressBytes;
+        private readonly HashSet<string> testNames;
+        private readonly Dictionary<string, int> nameIndexes =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> names = new List<string>();
+        private readonly List<ForwardTraceEvent> events = new List<ForwardTraceEvent>();
+        private volatile bool stopRequested;
+        private bool disposed;
+
+        public ForwardingCaptureReadyInfo ReadyInfo { get; private set; }
+
+        internal ForwardingCaptureSession(IntPtr handle, int maximumPackets,
+            IPAddress localAddress, IPAddress clientAddress,
+            IPAddress[] forwardingLocalAddresses, IPAddress[] masterAddresses,
+            string[] queryNames, ForwardingCaptureReadyInfo readyInfo)
+        {
+            this.handle = handle;
+            this.maximumPackets = maximumPackets;
+            serviceAddressBytes = localAddress.GetAddressBytes();
+            forwardingLocalAddressBytes = new byte[forwardingLocalAddresses.Length][];
+            for (int i = 0; i < forwardingLocalAddresses.Length; i++)
+                forwardingLocalAddressBytes[i] = forwardingLocalAddresses[i].GetAddressBytes();
+            clientAddressBytes = clientAddress.GetAddressBytes();
+            masterAddressBytes = new byte[masterAddresses.Length][];
+            for (int i = 0; i < masterAddresses.Length; i++)
+                masterAddressBytes[i] = masterAddresses[i].GetAddressBytes();
+            testNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < queryNames.Length; i++)
+                testNames.Add(NormalizeName(queryNames[i]));
+            ReadyInfo = readyInfo;
+        }
+
+        public Task<ForwardingCaptureResult> RunAsync(int durationSeconds)
+        {
+            return Task.Factory.StartNew(() => Run(durationSeconds),
+                System.Threading.CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+        }
+
+        public ForwardingCaptureResult Run(int durationSeconds)
+        {
+            if (disposed) throw new ObjectDisposedException("ForwardingCaptureSession");
+            DateTime startUtc = DateTime.UtcNow;
+            Stopwatch timer = Stopwatch.StartNew();
+            long capturedPackets = 0;
+            long parsedPackets = 0;
+            long unparsedPackets = 0;
+            bool packetLimit = false;
+
+            while (!stopRequested && timer.Elapsed.TotalSeconds < durationSeconds)
+            {
+                IntPtr headerPointer;
+                IntPtr packetPointer;
+                int status = ForwardPcapNative.pcap_next_ex(handle,
+                    out headerPointer, out packetPointer);
+                if (status == 0) continue;
+                if (status == -2) break;
+                if (status < 0) throw new IOException(ForwardPcapNative.Error(handle));
+
+                ForwardPcapPacketHeader header = (ForwardPcapPacketHeader)
+                    Marshal.PtrToStructure(headerPointer, typeof(ForwardPcapPacketHeader));
+                int length = checked((int)header.CapturedLength);
+                if (length <= 0) continue;
+                if (capturedPackets >= maximumPackets)
+                {
+                    packetLimit = true;
+                    break;
+                }
+                capturedPackets++;
+                byte[] packet = new byte[length];
+                Marshal.Copy(packetPointer, packet, 0, length);
+                ParsedForwardDnsPacket parsed;
+                if (!TryParsePacket(packet, out parsed))
+                {
+                    unparsedPackets++;
+                    continue;
+                }
+                parsedPackets++;
+                if (!testNames.Contains(parsed.QueryName)) continue;
+
+                byte kind;
+                ushort peerIndex = ushort.MaxValue;
+                if (AddressesEqual(parsed.SourceAddress, clientAddressBytes) &&
+                    AddressesEqual(parsed.DestinationAddress, serviceAddressBytes) &&
+                    !parsed.IsResponse && parsed.DestinationPort == 53)
+                {
+                    kind = ForwardTraceKind.ClientQuery;
+                }
+                else if (AddressesEqual(parsed.DestinationAddress, clientAddressBytes) &&
+                    AddressesEqual(parsed.SourceAddress, serviceAddressBytes) &&
+                    parsed.IsResponse && parsed.SourcePort == 53)
+                {
+                    kind = ForwardTraceKind.ClientResponse;
+                }
+                else
+                {
+                    if (!parsed.IsResponse &&
+                        !IsForwardingLocalAddress(parsed.SourceAddress)) continue;
+                    if (parsed.IsResponse &&
+                        !IsForwardingLocalAddress(parsed.DestinationAddress)) continue;
+                    int masterIndex = FindMaster(parsed.IsResponse ?
+                        parsed.SourceAddress : parsed.DestinationAddress);
+                    if (masterIndex < 0) continue;
+                    if (!parsed.IsResponse && parsed.DestinationPort == 53)
+                        kind = ForwardTraceKind.ForwardQuery;
+                    else if (parsed.IsResponse && parsed.SourcePort == 53)
+                        kind = ForwardTraceKind.ForwardResponse;
+                    else continue;
+                    peerIndex = checked((ushort)masterIndex);
+                }
+
+                int nameIndex;
+                if (!nameIndexes.TryGetValue(parsed.QueryName, out nameIndex))
+                {
+                    nameIndex = names.Count;
+                    names.Add(parsed.QueryName);
+                    nameIndexes.Add(parsed.QueryName, nameIndex);
+                }
+                long timestamp = ((long)header.Timestamp.Seconds * 1000000L) +
+                    header.Timestamp.Microseconds;
+                events.Add(new ForwardTraceEvent
+                {
+                    TimestampMicroseconds = timestamp,
+                    Kind = kind,
+                    Tcp = parsed.Tcp,
+                    Truncated = parsed.Truncated,
+                    LocalPort = parsed.IsResponse ? parsed.DestinationPort : parsed.SourcePort,
+                    TransactionId = parsed.TransactionId,
+                    PeerIndex = peerIndex,
+                    NameIndex = nameIndex,
+                    QueryType = parsed.QueryType,
+                    ResponseCode = parsed.ResponseCode
+                });
+
+            }
+
+            timer.Stop();
+            ForwardPcapStatistics statistics;
+            bool statisticsAvailable = ForwardPcapNative.pcap_stats(handle, out statistics) == 0;
+            return new ForwardingCaptureResult
+            {
+                ComputerName = ReadyInfo.ComputerName,
+                LocalAddress = ReadyInfo.LocalAddress,
+                ClientAddress = ReadyInfo.ClientAddress,
+                ForwardingLocalAddresses = ReadyInfo.ForwardingLocalAddresses,
+                MasterAddresses = ReadyInfo.MasterAddresses,
+                AdapterName = ReadyInfo.AdapterName,
+                DeviceName = ReadyInfo.DeviceName,
+                Filter = ReadyInfo.Filter,
+                NpcapVersion = ReadyInfo.NpcapVersion,
+                TimestampSource = ReadyInfo.TimestampSource,
+                CaptureStartUtc = startUtc,
+                CaptureEndUtc = DateTime.UtcNow,
+                CapturedPackets = capturedPackets,
+                ParsedDnsPackets = parsedPackets,
+                RelevantEvents = events.Count,
+                UnparsedDnsPackets = unparsedPackets,
+                PcapReceived = statisticsAvailable ? statistics.Received : 0,
+                PcapDropped = statisticsAvailable ? statistics.Dropped : 0,
+                InterfaceDropped = statisticsAvailable ? statistics.InterfaceDropped : 0,
+                StatisticsAvailable = statisticsAvailable,
+                PacketLimitReached = packetLimit,
+                CompressedEvents = ForwardTraceCodec.Encode(names, events)
+            };
+        }
+
+        private int FindMaster(byte[] address)
+        {
+            for (int i = 0; i < masterAddressBytes.Length; i++)
+                if (AddressesEqual(address, masterAddressBytes[i])) return i;
+            return -1;
+        }
+
+        private bool IsForwardingLocalAddress(byte[] address)
+        {
+            for (int i = 0; i < forwardingLocalAddressBytes.Length; i++)
+                if (AddressesEqual(address, forwardingLocalAddressBytes[i])) return true;
+            return false;
+        }
+
+        private static bool AddressesEqual(byte[] first, byte[] second)
+        {
+            if (first == null || second == null || first.Length != second.Length) return false;
+            for (int i = 0; i < first.Length; i++)
+                if (first[i] != second[i]) return false;
+            return true;
+        }
+
+        private static bool TryParsePacket(byte[] packet, out ParsedForwardDnsPacket parsed)
+        {
+            parsed = null;
+            if (packet == null || packet.Length < 14) return false;
+            int ipOffset = 14;
+            ushort etherType = ReadUInt16(packet, 12);
+            while ((etherType == 0x8100 || etherType == 0x88a8) &&
+                packet.Length >= ipOffset + 4)
+            {
+                etherType = ReadUInt16(packet, ipOffset + 2);
+                ipOffset += 4;
+            }
+
+            byte protocol;
+            int transportOffset;
+            byte[] sourceAddress;
+            byte[] destinationAddress;
+            if (etherType == 0x0800)
+            {
+                if (packet.Length < ipOffset + 20 || (packet[ipOffset] >> 4) != 4) return false;
+                int ipHeaderLength = (packet[ipOffset] & 15) * 4;
+                if (ipHeaderLength < 20 || packet.Length < ipOffset + ipHeaderLength) return false;
+                ushort fragment = ReadUInt16(packet, ipOffset + 6);
+                if ((fragment & 0x1fff) != 0) return false;
+                protocol = packet[ipOffset + 9];
+                transportOffset = ipOffset + ipHeaderLength;
+                sourceAddress = CopyBytes(packet, ipOffset + 12, 4);
+                destinationAddress = CopyBytes(packet, ipOffset + 16, 4);
+            }
+            else if (etherType == 0x86dd)
+            {
+                if (packet.Length < ipOffset + 40 || (packet[ipOffset] >> 4) != 6) return false;
+                sourceAddress = CopyBytes(packet, ipOffset + 8, 16);
+                destinationAddress = CopyBytes(packet, ipOffset + 24, 16);
+                protocol = packet[ipOffset + 6];
+                transportOffset = ipOffset + 40;
+                if (!AdvanceIpv6Extensions(packet, ref protocol, ref transportOffset)) return false;
+            }
+            else return false;
+
+            bool tcp;
+            ushort sourcePort;
+            ushort destinationPort;
+            int dnsOffset;
+            if (protocol == 17)
+            {
+                if (packet.Length < transportOffset + 8) return false;
+                tcp = false;
+                sourcePort = ReadUInt16(packet, transportOffset);
+                destinationPort = ReadUInt16(packet, transportOffset + 2);
+                dnsOffset = transportOffset + 8;
+            }
+            else if (protocol == 6)
+            {
+                if (packet.Length < transportOffset + 20) return false;
+                tcp = true;
+                sourcePort = ReadUInt16(packet, transportOffset);
+                destinationPort = ReadUInt16(packet, transportOffset + 2);
+                int tcpHeaderLength = (packet[transportOffset + 12] >> 4) * 4;
+                if (tcpHeaderLength < 20 || packet.Length < transportOffset + tcpHeaderLength + 2)
+                    return false;
+                int payloadOffset = transportOffset + tcpHeaderLength;
+                ushort dnsLength = ReadUInt16(packet, payloadOffset);
+                if (dnsLength < 12) return false;
+                dnsOffset = payloadOffset + 2;
+            }
+            else return false;
+
+            if (sourcePort != 53 && destinationPort != 53) return false;
+            if (packet.Length < dnsOffset + 12) return false;
+            ushort flags = ReadUInt16(packet, dnsOffset + 2);
+            bool response = (flags & 0x8000) != 0;
+            if ((!response && destinationPort != 53) || (response && sourcePort != 53))
+                return false;
+            if (ReadUInt16(packet, dnsOffset + 4) == 0) return false;
+            string queryName;
+            int nextOffset;
+            if (!TryReadDnsName(packet, dnsOffset, dnsOffset + 12,
+                out queryName, out nextOffset)) return false;
+            if (packet.Length < nextOffset + 4) return false;
+
+            parsed = new ParsedForwardDnsPacket
+            {
+                SourceAddress = sourceAddress,
+                DestinationAddress = destinationAddress,
+                SourcePort = sourcePort,
+                DestinationPort = destinationPort,
+                TransactionId = ReadUInt16(packet, dnsOffset),
+                QueryName = NormalizeName(queryName),
+                QueryType = ReadUInt16(packet, nextOffset),
+                IsResponse = response,
+                Tcp = tcp,
+                Truncated = (flags & 0x0200) != 0,
+                ResponseCode = (byte)(flags & 15)
+            };
+            return true;
+        }
+
+        private static bool AdvanceIpv6Extensions(byte[] packet, ref byte protocol,
+            ref int offset)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                if (protocol == 6 || protocol == 17) return true;
+                if (protocol == 0 || protocol == 43 || protocol == 60)
+                {
+                    if (packet.Length < offset + 2) return false;
+                    byte next = packet[offset];
+                    int length = (packet[offset + 1] + 1) * 8;
+                    if (packet.Length < offset + length) return false;
+                    protocol = next;
+                    offset += length;
+                }
+                else if (protocol == 44)
+                {
+                    if (packet.Length < offset + 8) return false;
+                    ushort fragment = ReadUInt16(packet, offset + 2);
+                    if ((fragment & 0xfff8) != 0) return false;
+                    protocol = packet[offset];
+                    offset += 8;
+                }
+                else if (protocol == 51)
+                {
+                    if (packet.Length < offset + 2) return false;
+                    byte next = packet[offset];
+                    int length = (packet[offset + 1] + 2) * 4;
+                    if (packet.Length < offset + length) return false;
+                    protocol = next;
+                    offset += length;
+                }
+                else return false;
+            }
+            return protocol == 6 || protocol == 17;
+        }
+
+        private static bool TryReadDnsName(byte[] packet, int dnsOffset, int startOffset,
+            out string name, out int nextOffset)
+        {
+            name = null;
+            nextOffset = startOffset;
+            StringBuilder builder = new StringBuilder();
+            int offset = startOffset;
+            bool jumped = false;
+            int jumps = 0;
+            while (offset < packet.Length && jumps < 32)
+            {
+                byte length = packet[offset];
+                if (length == 0)
+                {
+                    if (!jumped) nextOffset = offset + 1;
+                    name = builder.ToString();
+                    return name.Length > 0;
+                }
+                if ((length & 0xc0) == 0xc0)
+                {
+                    if (offset + 1 >= packet.Length) return false;
+                    int pointer = dnsOffset + (((length & 0x3f) << 8) | packet[offset + 1]);
+                    if (!jumped) nextOffset = offset + 2;
+                    offset = pointer;
+                    jumped = true;
+                    jumps++;
+                    continue;
+                }
+                if ((length & 0xc0) != 0 || length > 63 ||
+                    offset + 1 + length > packet.Length) return false;
+                if (builder.Length > 0) builder.Append('.');
+                for (int i = 0; i < length; i++)
+                {
+                    byte value = packet[offset + 1 + i];
+                    if (value < 33 || value > 126) return false;
+                    builder.Append((char)value);
+                }
+                offset += 1 + length;
+                if (!jumped) nextOffset = offset;
+            }
+            return false;
+        }
+
+        private static byte[] CopyBytes(byte[] source, int offset, int count)
+        {
+            byte[] result = new byte[count];
+            Buffer.BlockCopy(source, offset, result, 0, count);
+            return result;
+        }
+
+        private static ushort ReadUInt16(byte[] value, int offset)
+        {
+            return (ushort)((value[offset] << 8) | value[offset + 1]);
+        }
+
+        private static string NormalizeName(string value)
+        {
+            if (value == null) return String.Empty;
+            return value.Trim().TrimEnd('.').ToLowerInvariant();
+        }
+
+        public void RequestStop() { stopRequested = true; }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            if (handle != IntPtr.Zero) ForwardPcapNative.pcap_close(handle);
+        }
+    }
+
+    public static class ForwardingCaptureRunner
+    {
+        private const int EthernetDataLink = 1;
+
+        public static ForwardingCaptureSession Open(string localAddress,
+            string clientAddress, string[] forwardingLocalAddresses,
+            string[] masterAddresses, string[] queryNames,
+            int snapshotLength, int bufferMegabytes, int maximumPackets)
+        {
+            IPAddress local;
+            IPAddress client;
+            if (!IPAddress.TryParse(localAddress, out local))
+                throw new ArgumentException("The local capture address is invalid.", "localAddress");
+            if (!IPAddress.TryParse(clientAddress, out client))
+                throw new ArgumentException("The client capture address is invalid.", "clientAddress");
+            if (masterAddresses == null || masterAddresses.Length == 0)
+                throw new ArgumentException("At least one conditional forwarder master is required.",
+                    "masterAddresses");
+            if (queryNames == null || queryNames.Length == 0)
+                throw new ArgumentException("At least one test name is required.", "queryNames");
+
+            List<IPAddress> forwardingLocals = new List<IPAddress>();
+            HashSet<string> uniqueLocals =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (forwardingLocalAddresses != null)
+            {
+                for (int i = 0; i < forwardingLocalAddresses.Length; i++)
+                {
+                    IPAddress forwardingLocal;
+                    if (!IPAddress.TryParse(forwardingLocalAddresses[i], out forwardingLocal))
+                        throw new ArgumentException("Invalid forwarding source address: " +
+                            forwardingLocalAddresses[i]);
+                    if (uniqueLocals.Add(forwardingLocal.ToString()))
+                        forwardingLocals.Add(forwardingLocal);
+                }
+            }
+            if (forwardingLocals.Count == 0) forwardingLocals.Add(local);
+
+            List<IPAddress> masters = new List<IPAddress>();
+            HashSet<string> unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < masterAddresses.Length; i++)
+            {
+                IPAddress master;
+                if (!IPAddress.TryParse(masterAddresses[i], out master))
+                    throw new ArgumentException("Invalid conditional forwarder master: " +
+                        masterAddresses[i]);
+                if (unique.Add(master.ToString())) masters.Add(master);
+            }
+
+            NetworkInterface selected = null;
+            foreach (NetworkInterface adapter in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                foreach (UnicastIPAddressInformation address in
+                    adapter.GetIPProperties().UnicastAddresses)
+                {
+                    if (address.Address.Equals(local))
+                    {
+                        selected = adapter;
+                        break;
+                    }
+                }
+                if (selected != null) break;
+            }
+            if (selected == null)
+                throw new InvalidOperationException("No local network adapter owns " +
+                    localAddress + ".");
+
+            string id = selected.Id;
+            if (!id.StartsWith("{", StringComparison.Ordinal)) id = "{" + id + "}";
+            string deviceName = "\\Device\\NPF_" + id;
+            StringBuilder peerFilter = new StringBuilder();
+            peerFilter.Append("host ").Append(client.ToString());
+            for (int i = 0; i < masters.Count; i++)
+                peerFilter.Append(" or host ").Append(masters[i].ToString());
+            string filter = "(udp or tcp) and port 53 and (" + peerFilter + ")";
+            StringBuilder error = new StringBuilder(ForwardPcapNative.ErrorBufferSize);
+            IntPtr handle = ForwardPcapNative.pcap_create(deviceName, error);
+            if (handle == IntPtr.Zero)
+                throw new InvalidOperationException("Npcap could not open " + deviceName +
+                    ": " + error);
+            try
+            {
+                if (ForwardPcapNative.pcap_set_snaplen(handle, snapshotLength) != 0)
+                    throw new InvalidOperationException(ForwardPcapNative.Error(handle));
+                if (ForwardPcapNative.pcap_set_promisc(handle, 0) != 0)
+                    throw new InvalidOperationException(ForwardPcapNative.Error(handle));
+                if (ForwardPcapNative.pcap_set_timeout(handle, 100) != 0)
+                    throw new InvalidOperationException(ForwardPcapNative.Error(handle));
+                if (ForwardPcapNative.pcap_set_buffer_size(handle,
+                    checked(bufferMegabytes * 1024 * 1024)) != 0)
+                    throw new InvalidOperationException(ForwardPcapNative.Error(handle));
+                int activation = ForwardPcapNative.pcap_activate(handle);
+                if (activation < 0)
+                    throw new InvalidOperationException("Npcap activation failed: " +
+                        ForwardPcapNative.Error(handle));
+                if (ForwardPcapNative.pcap_datalink(handle) != EthernetDataLink)
+                    throw new NotSupportedException("Forwarding trace currently requires an Ethernet Npcap data link.");
+
+                ForwardBpfProgram program;
+                if (ForwardPcapNative.pcap_compile(handle, out program, filter, 1,
+                    0xffffffff) != 0)
+                    throw new InvalidOperationException("Npcap forwarding filter compilation failed: " +
+                        ForwardPcapNative.Error(handle));
+                try
+                {
+                    if (ForwardPcapNative.pcap_setfilter(handle, ref program) != 0)
+                        throw new InvalidOperationException("Npcap forwarding filter activation failed: " +
+                            ForwardPcapNative.Error(handle));
+                }
+                finally { ForwardPcapNative.pcap_freecode(ref program); }
+
+                string[] normalizedMasters = new string[masters.Count];
+                for (int i = 0; i < masters.Count; i++)
+                    normalizedMasters[i] = masters[i].ToString();
+                ForwardingCaptureReadyInfo ready = new ForwardingCaptureReadyInfo
+                {
+                    ComputerName = Environment.MachineName,
+                    LocalAddress = local.ToString(),
+                    ClientAddress = client.ToString(),
+                    ForwardingLocalAddresses = forwardingLocals.ConvertAll(
+                        delegate(IPAddress value) { return value.ToString(); }).ToArray(),
+                    MasterAddresses = normalizedMasters,
+                    AdapterName = selected.Name,
+                    DeviceName = deviceName,
+                    Filter = filter,
+                    NpcapVersion = ForwardPcapNative.Version(),
+                    TimestampSource = "Npcap default host timestamp (microsecond representation)"
+                };
+                return new ForwardingCaptureSession(handle, maximumPackets, local, client,
+                    forwardingLocals.ToArray(), masters.ToArray(), queryNames, ready);
+            }
+            catch
+            {
+                ForwardPcapNative.pcap_close(handle);
+                throw;
+            }
+        }
+    }
+
+    internal sealed class ForwardTraceData
+    {
+        internal string[] Names;
+        internal ForwardTraceEvent[] Events;
+    }
+
+    internal static class ForwardTraceCodec
+    {
+        private const int Magic = 0x44465431;
+
+        internal static byte[] Encode(List<string> names, List<ForwardTraceEvent> events)
+        {
+            using (MemoryStream output = new MemoryStream())
+            {
+                using (GZipStream gzip = new GZipStream(output, CompressionMode.Compress, true))
+                using (BinaryWriter writer = new BinaryWriter(gzip, Encoding.UTF8, true))
+                {
+                    writer.Write(Magic);
+                    writer.Write(1);
+                    writer.Write(names.Count);
+                    for (int i = 0; i < names.Count; i++) writer.Write(names[i]);
+                    writer.Write(events.Count);
+                    for (int i = 0; i < events.Count; i++)
+                    {
+                        ForwardTraceEvent item = events[i];
+                        writer.Write(item.TimestampMicroseconds);
+                        writer.Write(item.Kind);
+                        writer.Write(item.Tcp);
+                        writer.Write(item.Truncated);
+                        writer.Write(item.LocalPort);
+                        writer.Write(item.TransactionId);
+                        writer.Write(item.PeerIndex);
+                        writer.Write(item.NameIndex);
+                        writer.Write(item.QueryType);
+                        writer.Write(item.ResponseCode);
+                    }
+                }
+                return output.ToArray();
+            }
+        }
+
+        internal static ForwardTraceData Decode(byte[] compressed)
+        {
+            if (compressed == null || compressed.Length == 0)
+                return new ForwardTraceData
+                {
+                    Names = new string[0], Events = new ForwardTraceEvent[0]
+                };
+            using (MemoryStream input = new MemoryStream(compressed, false))
+            using (GZipStream gzip = new GZipStream(input, CompressionMode.Decompress))
+            using (BinaryReader reader = new BinaryReader(gzip, Encoding.UTF8))
+            {
+                if (reader.ReadInt32() != Magic)
+                    throw new InvalidDataException("Invalid forwarding capture data.");
+                if (reader.ReadInt32() != 1)
+                    throw new InvalidDataException("Unsupported forwarding capture data version.");
+                int nameCount = reader.ReadInt32();
+                if (nameCount < 0 || nameCount > 10000000)
+                    throw new InvalidDataException("Invalid forwarding name count.");
+                string[] names = new string[nameCount];
+                for (int i = 0; i < nameCount; i++) names[i] = reader.ReadString();
+                int eventCount = reader.ReadInt32();
+                if (eventCount < 0 || eventCount > 100000000)
+                    throw new InvalidDataException("Invalid forwarding event count.");
+                ForwardTraceEvent[] events = new ForwardTraceEvent[eventCount];
+                for (int i = 0; i < eventCount; i++)
+                {
+                    events[i] = new ForwardTraceEvent
+                    {
+                        TimestampMicroseconds = reader.ReadInt64(),
+                        Kind = reader.ReadByte(),
+                        Tcp = reader.ReadBoolean(),
+                        Truncated = reader.ReadBoolean(),
+                        LocalPort = reader.ReadUInt16(),
+                        TransactionId = reader.ReadUInt16(),
+                        PeerIndex = reader.ReadUInt16(),
+                        NameIndex = reader.ReadInt32(),
+                        QueryType = reader.ReadUInt16(),
+                        ResponseCode = reader.ReadByte()
+                    };
+                }
+                return new ForwardTraceData { Names = names, Events = events };
+            }
+        }
+    }
+
+    internal struct ClientTraceKey : IEquatable<ClientTraceKey>
+    {
+        internal ushort Port;
+        internal ushort TransactionId;
+        internal bool Tcp;
+
+        public bool Equals(ClientTraceKey other)
+        {
+            return Port == other.Port && TransactionId == other.TransactionId &&
+                Tcp == other.Tcp;
+        }
+        public override bool Equals(object value)
+        {
+            return value is ClientTraceKey && Equals((ClientTraceKey)value);
+        }
+        public override int GetHashCode()
+        {
+            return (Port << 16) ^ TransactionId ^ (Tcp ? Int32.MinValue : 0);
+        }
+    }
+
+    internal struct AttemptTraceKey : IEquatable<AttemptTraceKey>
+    {
+        internal ushort PeerIndex;
+        internal ushort Port;
+        internal ushort TransactionId;
+        internal bool Tcp;
+
+        public bool Equals(AttemptTraceKey other)
+        {
+            return PeerIndex == other.PeerIndex && Port == other.Port &&
+                TransactionId == other.TransactionId && Tcp == other.Tcp;
+        }
+        public override bool Equals(object value)
+        {
+            return value is AttemptTraceKey && Equals((AttemptTraceKey)value);
+        }
+        public override int GetHashCode()
+        {
+            return (PeerIndex << 24) ^ (Port << 8) ^ TransactionId ^
+                (Tcp ? Int32.MinValue : 0);
+        }
+    }
+
+    internal sealed class ClientTransactionState
+    {
+        internal string Name;
+        internal ushort QueryType;
+        internal long RequestUs;
+        internal long ResponseUs;
+        internal byte ResponseCode;
+    }
+
+    internal sealed class AttemptState
+    {
+        internal string Name;
+        internal ushort QueryType;
+        internal ushort PeerIndex;
+        internal ushort TransactionId;
+        internal bool Tcp;
+        internal bool Truncated;
+        internal long QueryUs;
+        internal long ResponseUs;
+        internal byte ResponseCode;
+    }
+
+    internal sealed class FlightState
+    {
+        internal string Name;
+        internal ushort QueryType;
+        internal List<AttemptState> Attempts = new List<AttemptState>();
+        internal long FirstAttemptUs;
+        internal long LastAttemptUs;
+        internal long TerminalResponseUs;
+        internal long FirstClientRequestUs;
+        internal long FirstClientResponseUs;
+        internal long LastClientResponseUs;
+        internal int ClientQueries;
+        internal int ClientResponses;
+        internal byte FinalClientResponseCode;
+    }
+
+    public sealed class ForwardingLatencySummary
+    {
+        public long Count { get; internal set; }
+        public double MinimumMs { get; internal set; }
+        public double AverageMs { get; internal set; }
+        public double P50Ms { get; internal set; }
+        public double P95Ms { get; internal set; }
+        public double P99Ms { get; internal set; }
+        public double MaximumMs { get; internal set; }
+    }
+
+    public sealed class ForwardingAttemptTrace
+    {
+        public int AttemptNumber { get; internal set; }
+        public string TargetAddress { get; internal set; }
+        public string Protocol { get; internal set; }
+        public ushort TransactionId { get; internal set; }
+        public DateTime QuerySentUtc { get; internal set; }
+        public DateTime? ResponseReceivedUtc { get; internal set; }
+        public double ObservedWaitMs { get; internal set; }
+        public int ResponseCode { get; internal set; }
+        public string ResponseCodeName { get; internal set; }
+        public bool Truncated { get; internal set; }
+        public string Outcome { get; internal set; }
+    }
+
+    public sealed class ForwardingFlightTrace
+    {
+        public string ConditionalForwarderZone { get; internal set; }
+        public string QueryName { get; internal set; }
+        public string QueryType { get; internal set; }
+        public DateTime? FirstClientQueryReceivedUtc { get; internal set; }
+        public DateTime FirstForwardAttemptUtc { get; internal set; }
+        public DateTime? FinalUpstreamResponseUtc { get; internal set; }
+        public DateTime? FirstClientResponseUtc { get; internal set; }
+        public DateTime? LastClientResponseUtc { get; internal set; }
+        public int WaitingClientQueries { get; internal set; }
+        public int ClientResponses { get; internal set; }
+        public int CoalescedClientQueries { get; internal set; }
+        public double PreForwardDelayMs { get; internal set; }
+        public double ForwardingDurationMs { get; internal set; }
+        public double PostForwardDelayMs { get; internal set; }
+        public double ObservedServerTurnaroundMs { get; internal set; }
+        public bool DifferentMasterFallbackUsed { get; internal set; }
+        public int DistinctMastersAttempted { get; internal set; }
+        public int SameMasterRetries { get; internal set; }
+        public string FinalResponder { get; internal set; }
+        public string Status { get; internal set; }
+        public int FinalClientResponseCode { get; internal set; }
+        public string FinalClientResponseCodeName { get; internal set; }
+        public ForwardingAttemptTrace[] Attempts { get; internal set; }
+        internal int Priority { get; set; }
+        internal int Sequence { get; set; }
+    }
+
+    internal sealed class RetainedFlightComparer : IComparer<ForwardingFlightTrace>
+    {
+        public int Compare(ForwardingFlightTrace first, ForwardingFlightTrace second)
+        {
+            if (Object.ReferenceEquals(first, second)) return 0;
+            int value = first.Priority.CompareTo(second.Priority);
+            if (value != 0) return value;
+            value = first.ForwardingDurationMs.CompareTo(second.ForwardingDurationMs);
+            if (value != 0) return value;
+            value = second.FirstForwardAttemptUtc.CompareTo(first.FirstForwardAttemptUtc);
+            if (value != 0) return value;
+            return first.Sequence.CompareTo(second.Sequence);
+        }
+    }
+
+    public sealed class ForwardingMasterSummary
+    {
+        public string Address { get; internal set; }
+        public int ConfiguredUnionPosition { get; internal set; }
+        public long Queries { get; internal set; }
+        public long Responses { get; internal set; }
+        public long NoResponseObservations { get; internal set; }
+        public long NoErrorResponses { get; internal set; }
+        public long NegativeResponses { get; internal set; }
+        public long FailureResponses { get; internal set; }
+        public ForwardingLatencySummary ResponseLatency { get; internal set; }
+    }
+
+    public sealed class ConditionalForwardingAnalysis
+    {
+        public string Server { get; internal set; }
+        public string ServerAddress { get; internal set; }
+        public string[] ConfiguredMasterUnion { get; internal set; }
+        public long ClientQueriesObserved { get; internal set; }
+        public long ClientResponsesObserved { get; internal set; }
+        public long ClientTransactionsAttributedToForwarding { get; internal set; }
+        public long ClientTransactionsWithoutObservedForwarding { get; internal set; }
+        public long CoalescedClientQueries { get; internal set; }
+        public long TotalFlights { get; internal set; }
+        public long AnsweredFlights { get; internal set; }
+        public long NegativeAnswerFlights { get; internal set; }
+        public long FailedFlights { get; internal set; }
+        public long FlightsUsingDifferentMaster { get; internal set; }
+        public long FlightsWithSameMasterRetry { get; internal set; }
+        public long UnmatchedForwardResponses { get; internal set; }
+        public int ReturnedFlights { get; internal set; }
+        public long OmittedFlights { get; internal set; }
+        public ForwardingLatencySummary ForwardingDuration { get; internal set; }
+        public ForwardingMasterSummary[] Masters { get; internal set; }
+        public ForwardingFlightTrace[] Flights { get; internal set; }
+    }
+
+    public static class ForwardingCaptureAnalyzer
+    {
+        public static ConditionalForwardingAnalysis Analyze(string server,
+            string serverAddress, string[] masterAddresses, string[] conditionalZones,
+            byte[] compressedEvents, DateTime captureEndUtc, int maximumFlights)
+        {
+            ForwardTraceData data = ForwardTraceCodec.Decode(compressedEvents);
+            Array.Sort(data.Events, delegate(ForwardTraceEvent first, ForwardTraceEvent second)
+            {
+                return first.TimestampMicroseconds.CompareTo(second.TimestampMicroseconds);
+            });
+
+            List<ClientTransactionState> clients = BuildClientTransactions(data);
+            long unmatchedForwardResponses;
+            List<AttemptState> attempts = BuildAttempts(data, out unmatchedForwardResponses);
+            List<FlightState> flights = BuildFlights(attempts, clients);
+            AttributeClients(clients, flights);
+
+            long captureEndUs = ToUnixMicroseconds(captureEndUtc);
+            SortedSet<ForwardingFlightTrace> retainedFlights =
+                new SortedSet<ForwardingFlightTrace>(new RetainedFlightComparer());
+            List<double> forwardingDurations = new List<double>();
+            List<double>[] masterLatencies = new List<double>[masterAddresses.Length];
+            long[] masterQueries = new long[masterAddresses.Length];
+            long[] masterResponses = new long[masterAddresses.Length];
+            long[] masterNoResponses = new long[masterAddresses.Length];
+            long[] masterNoError = new long[masterAddresses.Length];
+            long[] masterNegative = new long[masterAddresses.Length];
+            long[] masterFailure = new long[masterAddresses.Length];
+            for (int i = 0; i < masterLatencies.Length; i++)
+                masterLatencies[i] = new List<double>();
+
+            long answered = 0;
+            long negative = 0;
+            long failed = 0;
+            long fallback = 0;
+            long retry = 0;
+            long attributed = 0;
+            long coalesced = 0;
+            for (int i = 0; i < flights.Count; i++)
+            {
+                ForwardingFlightTrace flight = CreateFlightTrace(flights[i],
+                    masterAddresses, conditionalZones, captureEndUs);
+                flight.Sequence = i;
+                retainedFlights.Add(flight);
+                if (retainedFlights.Count > maximumFlights)
+                    retainedFlights.Remove(retainedFlights.Min);
+                forwardingDurations.Add(flight.ForwardingDurationMs);
+                attributed += flight.WaitingClientQueries;
+                coalesced += flight.CoalescedClientQueries;
+                if (flight.Status == "Answered") answered++;
+                else if (flight.Status == "NegativeAnswer") negative++;
+                else failed++;
+                if (flight.DifferentMasterFallbackUsed) fallback++;
+                if (flight.SameMasterRetries > 0) retry++;
+                for (int a = 0; a < flights[i].Attempts.Count; a++)
+                {
+                    AttemptState attempt = flights[i].Attempts[a];
+                    int master = attempt.PeerIndex;
+                    if (master < 0 || master >= masterAddresses.Length) continue;
+                    masterQueries[master]++;
+                    if (attempt.ResponseUs > 0)
+                    {
+                        masterResponses[master]++;
+                        masterLatencies[master].Add((attempt.ResponseUs - attempt.QueryUs) / 1000.0);
+                        if (attempt.ResponseCode == 0) masterNoError[master]++;
+                        else if (attempt.ResponseCode == 3) masterNegative[master]++;
+                        else masterFailure[master]++;
+                    }
+                    else masterNoResponses[master]++;
+                }
+            }
+
+            List<ForwardingFlightTrace> outputFlights =
+                new List<ForwardingFlightTrace>(retainedFlights);
+            outputFlights.Sort(delegate(ForwardingFlightTrace first,
+                ForwardingFlightTrace second)
+            {
+                int priority = second.Priority.CompareTo(first.Priority);
+                if (priority != 0) return priority;
+                int duration = second.ForwardingDurationMs.CompareTo(first.ForwardingDurationMs);
+                if (duration != 0) return duration;
+                return first.FirstForwardAttemptUtc.CompareTo(second.FirstForwardAttemptUtc);
+            });
+            int returned = outputFlights.Count;
+            ForwardingFlightTrace[] retained = new ForwardingFlightTrace[returned];
+            for (int i = 0; i < returned; i++) retained[i] = outputFlights[i];
+
+            ForwardingMasterSummary[] masters = new ForwardingMasterSummary[masterAddresses.Length];
+            for (int i = 0; i < masters.Length; i++)
+            {
+                masters[i] = new ForwardingMasterSummary
+                {
+                    Address = masterAddresses[i],
+                    ConfiguredUnionPosition = i + 1,
+                    Queries = masterQueries[i],
+                    Responses = masterResponses[i],
+                    NoResponseObservations = masterNoResponses[i],
+                    NoErrorResponses = masterNoError[i],
+                    NegativeResponses = masterNegative[i],
+                    FailureResponses = masterFailure[i],
+                    ResponseLatency = Metrics(masterLatencies[i])
+                };
+            }
+
+            long clientQueries = 0;
+            long clientResponses = 0;
+            for (int i = 0; i < clients.Count; i++)
+            {
+                clientQueries++;
+                if (clients[i].ResponseUs > 0) clientResponses++;
+            }
+            return new ConditionalForwardingAnalysis
+            {
+                Server = server,
+                ServerAddress = serverAddress,
+                ConfiguredMasterUnion = masterAddresses,
+                ClientQueriesObserved = clientQueries,
+                ClientResponsesObserved = clientResponses,
+                ClientTransactionsAttributedToForwarding = attributed,
+                ClientTransactionsWithoutObservedForwarding = Math.Max(0, clientQueries - attributed),
+                CoalescedClientQueries = coalesced,
+                TotalFlights = flights.Count,
+                AnsweredFlights = answered,
+                NegativeAnswerFlights = negative,
+                FailedFlights = failed,
+                FlightsUsingDifferentMaster = fallback,
+                FlightsWithSameMasterRetry = retry,
+                UnmatchedForwardResponses = unmatchedForwardResponses,
+                ReturnedFlights = returned,
+                OmittedFlights = flights.Count - returned,
+                ForwardingDuration = Metrics(forwardingDurations),
+                Masters = masters,
+                Flights = retained
+            };
+        }
+
+        private static List<ClientTransactionState> BuildClientTransactions(ForwardTraceData data)
+        {
+            Dictionary<ClientTraceKey, Queue<ClientTransactionState>> pending =
+                new Dictionary<ClientTraceKey, Queue<ClientTransactionState>>();
+            List<ClientTransactionState> clients = new List<ClientTransactionState>();
+            for (int i = 0; i < data.Events.Length; i++)
+            {
+                ForwardTraceEvent item = data.Events[i];
+                if (item.Kind != ForwardTraceKind.ClientQuery &&
+                    item.Kind != ForwardTraceKind.ClientResponse) continue;
+                ClientTraceKey key = new ClientTraceKey
+                {
+                    Port = item.LocalPort,
+                    TransactionId = item.TransactionId,
+                    Tcp = item.Tcp
+                };
+                if (item.Kind == ForwardTraceKind.ClientQuery)
+                {
+                    ClientTransactionState client = new ClientTransactionState
+                    {
+                        Name = data.Names[item.NameIndex],
+                        QueryType = item.QueryType,
+                        RequestUs = item.TimestampMicroseconds
+                    };
+                    clients.Add(client);
+                    Queue<ClientTransactionState> queue;
+                    if (!pending.TryGetValue(key, out queue))
+                    {
+                        queue = new Queue<ClientTransactionState>();
+                        pending.Add(key, queue);
+                    }
+                    queue.Enqueue(client);
+                }
+                else
+                {
+                    Queue<ClientTransactionState> queue;
+                    if (pending.TryGetValue(key, out queue) && queue.Count > 0)
+                    {
+                        ClientTransactionState client = queue.Dequeue();
+                        client.ResponseUs = item.TimestampMicroseconds;
+                        client.ResponseCode = item.ResponseCode;
+                        if (queue.Count == 0) pending.Remove(key);
+                    }
+                }
+            }
+            return clients;
+        }
+
+        private static List<AttemptState> BuildAttempts(ForwardTraceData data,
+            out long unmatchedResponses)
+        {
+            unmatchedResponses = 0;
+            Dictionary<AttemptTraceKey, Stack<AttemptState>> pending =
+                new Dictionary<AttemptTraceKey, Stack<AttemptState>>();
+            List<AttemptState> attempts = new List<AttemptState>();
+            for (int i = 0; i < data.Events.Length; i++)
+            {
+                ForwardTraceEvent item = data.Events[i];
+                if (item.Kind != ForwardTraceKind.ForwardQuery &&
+                    item.Kind != ForwardTraceKind.ForwardResponse) continue;
+                AttemptTraceKey key = new AttemptTraceKey
+                {
+                    PeerIndex = item.PeerIndex,
+                    Port = item.LocalPort,
+                    TransactionId = item.TransactionId,
+                    Tcp = item.Tcp
+                };
+                if (item.Kind == ForwardTraceKind.ForwardQuery)
+                {
+                    AttemptState attempt = new AttemptState
+                    {
+                        Name = data.Names[item.NameIndex],
+                        QueryType = item.QueryType,
+                        PeerIndex = item.PeerIndex,
+                        TransactionId = item.TransactionId,
+                        Tcp = item.Tcp,
+                        QueryUs = item.TimestampMicroseconds
+                    };
+                    attempts.Add(attempt);
+                    Stack<AttemptState> stack;
+                    if (!pending.TryGetValue(key, out stack))
+                    {
+                        stack = new Stack<AttemptState>();
+                        pending.Add(key, stack);
+                    }
+                    stack.Push(attempt);
+                }
+                else
+                {
+                    Stack<AttemptState> stack;
+                    if (pending.TryGetValue(key, out stack) && stack.Count > 0)
+                    {
+                        AttemptState attempt = stack.Pop();
+                        attempt.ResponseUs = item.TimestampMicroseconds;
+                        attempt.ResponseCode = item.ResponseCode;
+                        attempt.Truncated = item.Truncated;
+                        if (stack.Count == 0) pending.Remove(key);
+                    }
+                    else unmatchedResponses++;
+                }
+            }
+            attempts.Sort(delegate(AttemptState first, AttemptState second)
+            {
+                return first.QueryUs.CompareTo(second.QueryUs);
+            });
+            return attempts;
+        }
+
+        private static List<FlightState> BuildFlights(List<AttemptState> attempts,
+            List<ClientTransactionState> clients)
+        {
+            const long maximumGapUs = 60000000L;
+            Dictionary<string, List<long>> responseTimes =
+                new Dictionary<string, List<long>>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < clients.Count; i++)
+            {
+                if (clients[i].ResponseUs <= 0) continue;
+                string clientKey = clients[i].Name + "|" + clients[i].QueryType;
+                List<long> times;
+                if (!responseTimes.TryGetValue(clientKey, out times))
+                {
+                    times = new List<long>();
+                    responseTimes.Add(clientKey, times);
+                }
+                times.Add(clients[i].ResponseUs);
+            }
+            Dictionary<string, FlightState> active =
+                new Dictionary<string, FlightState>(StringComparer.OrdinalIgnoreCase);
+            List<FlightState> flights = new List<FlightState>();
+            for (int i = 0; i < attempts.Count; i++)
+            {
+                AttemptState attempt = attempts[i];
+                string key = attempt.Name + "|" + attempt.QueryType;
+                FlightState flight;
+                bool newFlight = !active.TryGetValue(key, out flight) ||
+                    attempt.QueryUs - flight.LastAttemptUs > maximumGapUs ||
+                    (flight.TerminalResponseUs > 0 &&
+                        attempt.QueryUs > flight.TerminalResponseUs);
+                if (!newFlight)
+                {
+                    List<long> times;
+                    if (responseTimes.TryGetValue(key, out times))
+                    {
+                        for (int r = 0; r < times.Count; r++)
+                        {
+                            if (times[r] > flight.LastAttemptUs &&
+                                times[r] < attempt.QueryUs)
+                            {
+                                newFlight = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (newFlight)
+                {
+                    flight = new FlightState
+                    {
+                        Name = attempt.Name,
+                        QueryType = attempt.QueryType,
+                        FirstAttemptUs = attempt.QueryUs,
+                        LastAttemptUs = attempt.QueryUs
+                    };
+                    flights.Add(flight);
+                    active[key] = flight;
+                }
+                flight.Attempts.Add(attempt);
+                flight.LastAttemptUs = attempt.QueryUs;
+                if (attempt.ResponseUs > 0 && !attempt.Truncated &&
+                    (attempt.ResponseCode == 0 || attempt.ResponseCode == 3))
+                {
+                    if (flight.TerminalResponseUs == 0 ||
+                        attempt.ResponseUs < flight.TerminalResponseUs)
+                        flight.TerminalResponseUs = attempt.ResponseUs;
+                }
+            }
+            return flights;
+        }
+
+        private static void AttributeClients(List<ClientTransactionState> clients,
+            List<FlightState> flights)
+        {
+            Dictionary<string, List<FlightState>> byName =
+                new Dictionary<string, List<FlightState>>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < flights.Count; i++)
+            {
+                string key = flights[i].Name + "|" + flights[i].QueryType;
+                List<FlightState> list;
+                if (!byName.TryGetValue(key, out list))
+                {
+                    list = new List<FlightState>();
+                    byName.Add(key, list);
+                }
+                list.Add(flights[i]);
+            }
+            for (int i = 0; i < clients.Count; i++)
+            {
+                ClientTransactionState client = clients[i];
+                string key = client.Name + "|" + client.QueryType;
+                List<FlightState> candidates;
+                if (!byName.TryGetValue(key, out candidates)) continue;
+                FlightState best = null;
+                long bestDistance = Int64.MaxValue;
+                for (int f = 0; f < candidates.Count; f++)
+                {
+                    FlightState flight = candidates[f];
+                    long effectiveEnd = flight.TerminalResponseUs > 0 ?
+                        flight.TerminalResponseUs : flight.LastAttemptUs + 60000000L;
+                    if (client.RequestUs > effectiveEnd) continue;
+                    if (client.ResponseUs > 0 && client.ResponseUs < flight.FirstAttemptUs)
+                        continue;
+                    if (flight.FirstAttemptUs - client.RequestUs > 60000000L) continue;
+                    long distance = Math.Abs(flight.FirstAttemptUs - client.RequestUs);
+                    if (distance < bestDistance)
+                    {
+                        best = flight;
+                        bestDistance = distance;
+                    }
+                }
+                if (best == null) continue;
+                best.ClientQueries++;
+                if (best.FirstClientRequestUs == 0 ||
+                    client.RequestUs < best.FirstClientRequestUs)
+                    best.FirstClientRequestUs = client.RequestUs;
+                if (client.ResponseUs > 0)
+                {
+                    best.ClientResponses++;
+                    if (best.FirstClientResponseUs == 0 ||
+                        client.ResponseUs < best.FirstClientResponseUs)
+                        best.FirstClientResponseUs = client.ResponseUs;
+                    if (client.ResponseUs > best.LastClientResponseUs)
+                        best.LastClientResponseUs = client.ResponseUs;
+                    best.FinalClientResponseCode = client.ResponseCode;
+                }
+            }
+        }
+
+        private static ForwardingFlightTrace CreateFlightTrace(FlightState state,
+            string[] masterAddresses, string[] zones, long captureEndUs)
+        {
+            state.Attempts.Sort(delegate(AttemptState first, AttemptState second)
+            {
+                return first.QueryUs.CompareTo(second.QueryUs);
+            });
+            HashSet<ushort> distinctMasters = new HashSet<ushort>();
+            ForwardingAttemptTrace[] attempts =
+                new ForwardingAttemptTrace[state.Attempts.Count];
+            AttemptState terminal = null;
+            bool anyResponse = false;
+            for (int i = 0; i < state.Attempts.Count; i++)
+            {
+                AttemptState attempt = state.Attempts[i];
+                distinctMasters.Add(attempt.PeerIndex);
+                if (attempt.ResponseUs > 0) anyResponse = true;
+                if (terminal == null && attempt.ResponseUs > 0 &&
+                    !attempt.Truncated &&
+                    (attempt.ResponseCode == 0 || attempt.ResponseCode == 3))
+                    terminal = attempt;
+                long waitEnd;
+                string outcome;
+                if (attempt.ResponseUs > 0)
+                {
+                    waitEnd = attempt.ResponseUs;
+                    outcome = attempt.Truncated ? "Truncated" :
+                        ResponseCodeName(attempt.ResponseCode);
+                }
+                else if (i + 1 < state.Attempts.Count)
+                {
+                    waitEnd = state.Attempts[i + 1].QueryUs;
+                    outcome = "NoResponseBeforeNextAttempt";
+                }
+                else if (state.FirstClientResponseUs > 0)
+                {
+                    waitEnd = state.FirstClientResponseUs;
+                    outcome = "NoResponseBeforeClientResponse";
+                }
+                else
+                {
+                    waitEnd = captureEndUs;
+                    outcome = "NoResponseBeforeCaptureEnd";
+                }
+                string target = attempt.PeerIndex < masterAddresses.Length ?
+                    masterAddresses[attempt.PeerIndex] : "Unknown";
+                attempts[i] = new ForwardingAttemptTrace
+                {
+                    AttemptNumber = i + 1,
+                    TargetAddress = target,
+                    Protocol = attempt.Tcp ? "TCP" : "UDP",
+                    TransactionId = attempt.TransactionId,
+                    QuerySentUtc = UnixMicrosecondsToUtc(attempt.QueryUs),
+                    ResponseReceivedUtc = attempt.ResponseUs > 0 ?
+                        (DateTime?)UnixMicrosecondsToUtc(attempt.ResponseUs) : null,
+                    ObservedWaitMs = Round(Math.Max(0, waitEnd - attempt.QueryUs) / 1000.0),
+                    ResponseCode = attempt.ResponseUs > 0 ? attempt.ResponseCode : -1,
+                    ResponseCodeName = attempt.ResponseUs > 0 ?
+                        ResponseCodeName(attempt.ResponseCode) : null,
+                    Truncated = attempt.Truncated,
+                    Outcome = outcome
+                };
+            }
+
+            long finalUpstreamUs = terminal == null ? 0 : terminal.ResponseUs;
+            long forwardEndUs = finalUpstreamUs > 0 ? finalUpstreamUs :
+                (state.FirstClientResponseUs > 0 ? state.FirstClientResponseUs : captureEndUs);
+            string status;
+            if (terminal != null && terminal.ResponseCode == 0) status = "Answered";
+            else if (terminal != null && terminal.ResponseCode == 3) status = "NegativeAnswer";
+            else if (anyResponse) status = "FailedResponse";
+            else status = "NoResponse";
+            string responder = terminal != null && terminal.PeerIndex < masterAddresses.Length ?
+                masterAddresses[terminal.PeerIndex] : null;
+            double preForward = state.FirstClientRequestUs > 0 ?
+                (state.FirstAttemptUs - state.FirstClientRequestUs) / 1000.0 : 0.0;
+            double postForward = finalUpstreamUs > 0 && state.FirstClientResponseUs > 0 ?
+                (state.FirstClientResponseUs - finalUpstreamUs) / 1000.0 : 0.0;
+            double serverTurn = state.FirstClientRequestUs > 0 &&
+                state.LastClientResponseUs > 0 ?
+                (state.LastClientResponseUs - state.FirstClientRequestUs) / 1000.0 : 0.0;
+            bool masterFallback = distinctMasters.Count > 1;
+            int sameMasterRetries = Math.Max(0, state.Attempts.Count - distinctMasters.Count);
+            return new ForwardingFlightTrace
+            {
+                ConditionalForwarderZone = MatchZone(state.Name, zones),
+                QueryName = state.Name,
+                QueryType = QueryTypeName(state.QueryType),
+                FirstClientQueryReceivedUtc = state.FirstClientRequestUs > 0 ?
+                    (DateTime?)UnixMicrosecondsToUtc(state.FirstClientRequestUs) : null,
+                FirstForwardAttemptUtc = UnixMicrosecondsToUtc(state.FirstAttemptUs),
+                FinalUpstreamResponseUtc = finalUpstreamUs > 0 ?
+                    (DateTime?)UnixMicrosecondsToUtc(finalUpstreamUs) : null,
+                FirstClientResponseUtc = state.FirstClientResponseUs > 0 ?
+                    (DateTime?)UnixMicrosecondsToUtc(state.FirstClientResponseUs) : null,
+                LastClientResponseUtc = state.LastClientResponseUs > 0 ?
+                    (DateTime?)UnixMicrosecondsToUtc(state.LastClientResponseUs) : null,
+                WaitingClientQueries = state.ClientQueries,
+                ClientResponses = state.ClientResponses,
+                CoalescedClientQueries = Math.Max(0, state.ClientQueries - 1),
+                PreForwardDelayMs = Round(preForward),
+                ForwardingDurationMs = Round(Math.Max(0, forwardEndUs - state.FirstAttemptUs) / 1000.0),
+                PostForwardDelayMs = Round(postForward),
+                ObservedServerTurnaroundMs = Round(serverTurn),
+                DifferentMasterFallbackUsed = masterFallback,
+                DistinctMastersAttempted = distinctMasters.Count,
+                SameMasterRetries = sameMasterRetries,
+                FinalResponder = responder,
+                Status = status,
+                FinalClientResponseCode = state.ClientResponses > 0 ?
+                    state.FinalClientResponseCode : -1,
+                FinalClientResponseCodeName = state.ClientResponses > 0 ?
+                    ResponseCodeName(state.FinalClientResponseCode) : null,
+                Attempts = attempts,
+                Priority = masterFallback ? 4 :
+                    ((status == "FailedResponse" || status == "NoResponse") ? 3 :
+                    (sameMasterRetries > 0 ? 2 : 1))
+            };
+        }
+
+        private static string MatchZone(string name, string[] zones)
+        {
+            string best = null;
+            if (zones == null) return null;
+            for (int i = 0; i < zones.Length; i++)
+            {
+                string zone = zones[i].Trim().TrimEnd('.').ToLowerInvariant();
+                if (name.Equals(zone, StringComparison.OrdinalIgnoreCase) ||
+                    name.EndsWith("." + zone, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (best == null || zone.Length > best.Length) best = zone;
+                }
+            }
+            return best;
+        }
+
+        private static ForwardingLatencySummary Metrics(List<double> values)
+        {
+            ForwardingLatencySummary result = new ForwardingLatencySummary
+            {
+                Count = values.Count
+            };
+            if (values.Count == 0) return result;
+            double[] sorted = values.ToArray();
+            Array.Sort(sorted);
+            double sum = 0.0;
+            for (int i = 0; i < sorted.Length; i++) sum += sorted[i];
+            result.MinimumMs = Round(sorted[0]);
+            result.AverageMs = Round(sum / sorted.Length);
+            result.P50Ms = Round(Percentile(sorted, 0.50));
+            result.P95Ms = Round(Percentile(sorted, 0.95));
+            result.P99Ms = Round(Percentile(sorted, 0.99));
+            result.MaximumMs = Round(sorted[sorted.Length - 1]);
+            return result;
+        }
+
+        private static double Percentile(double[] values, double percentile)
+        {
+            if (values.Length == 1) return values[0];
+            double rank = percentile * (values.Length - 1);
+            int lower = (int)Math.Floor(rank);
+            int upper = (int)Math.Ceiling(rank);
+            if (lower == upper) return values[lower];
+            return values[lower] + (values[upper] - values[lower]) * (rank - lower);
+        }
+
+        private static long ToUnixMicroseconds(DateTime value)
+        {
+            DateTime utc = value.Kind == DateTimeKind.Utc ? value : value.ToUniversalTime();
+            return (utc.Ticks - new DateTime(1970, 1, 1, 0, 0, 0,
+                DateTimeKind.Utc).Ticks) / 10L;
+        }
+
+        private static DateTime UnixMicrosecondsToUtc(long value)
+        {
+            return new DateTime(1970, 1, 1, 0, 0, 0,
+                DateTimeKind.Utc).AddTicks(value * 10L);
+        }
+
+        private static double Round(double value) { return Math.Round(value, 3); }
+
+        private static string ResponseCodeName(int value)
+        {
+            switch (value)
+            {
+                case 0: return "NOERROR";
+                case 1: return "FORMERR";
+                case 2: return "SERVFAIL";
+                case 3: return "NXDOMAIN";
+                case 4: return "NOTIMP";
+                case 5: return "REFUSED";
+                default: return "RCODE" + value;
+            }
+        }
+
+        private static string QueryTypeName(ushort value)
+        {
+            switch (value)
+            {
+                case 1: return "A";
+                case 2: return "NS";
+                case 5: return "CNAME";
+                case 6: return "SOA";
+                case 12: return "PTR";
+                case 15: return "MX";
+                case 16: return "TXT";
+                case 28: return "AAAA";
+                case 33: return "SRV";
+                default: return value.ToString();
+            }
+        }
+    }
+}
+'@
+
+        if ($TraceConditionalForwarding -and -not $CoordinatedCapture) {
+            throw 'TraceConditionalForwarding requires CoordinatedCapture.'
+        }
+
+        if ($CoordinatedCapture -and -not ('DnsCoordinatedCaptureV424.CaptureRunner' -as [type])) {
+            if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+                throw 'CoordinatedCapture requires Windows on the test client.'
+            }
+            $npcapDirectory = if ([Environment]::Is64BitProcess) {
+                Join-Path $env:SystemRoot 'System32\Npcap'
+            } else {
+                Join-Path $env:SystemRoot 'SysWOW64\Npcap'
+            }
+            if (-not [IO.Directory]::Exists($npcapDirectory)) {
+                throw "Npcap runtime directory was not found: $npcapDirectory"
+            }
+            if (($env:Path -split ';') -notcontains $npcapDirectory) {
+                $env:Path = $npcapDirectory + ';' + $env:Path
+            }
+            Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition $coordinatedCaptureTypeDefinition
+        }
+
+        if ($TraceConditionalForwarding -and
+            -not ('DnsForwardingCaptureV410.ForwardingCaptureRunner' -as [type])) {
+            Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition $forwardingCaptureTypeDefinition
+        }
+
+        function Get-DnsCaptureSourceAddress {
+            param([Parameter(Mandatory)][string]$PeerAddress)
+            $peer = $null
+            if (-not [IPAddress]::TryParse($PeerAddress, [ref]$peer)) {
+                throw "The coordinated-capture peer address is invalid: $PeerAddress"
+            }
+            $socket = New-Object System.Net.Sockets.Socket @(
+                $peer.AddressFamily,
+                [System.Net.Sockets.SocketType]::Dgram,
+                [System.Net.Sockets.ProtocolType]::Udp
+            )
+            try {
+                $socket.Connect((New-Object System.Net.IPEndPoint -ArgumentList $peer, 53))
+                return ([System.Net.IPEndPoint]$socket.LocalEndPoint).Address.ToString()
+            } finally {
+                $socket.Dispose()
+            }
+        }
+
+        function Test-DnsCaptureCredentialFailure {
+            param([AllowEmptyString()][string]$Message)
+
+            if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+            if ($Message -match '(?i)cannot find the computer|server name cannot be resolved|client cannot connect|network path was not found|connection timed out|actively refused') {
+                return $false
+            }
+            return $Message -match '(?i)access is denied|user name or password is incorrect|logon failure|credentials? (?:were |was )?rejected|authentication failed|unauthorized|0x8009030[ce]'
+        }
+
+        function Get-DnsCaptureFallbackReason {
+            param([AllowEmptyString()][string]$Message)
+
+            $singleLine = ([string]$Message -replace '\s+', ' ').Trim()
+            if ([string]::IsNullOrWhiteSpace($singleLine)) {
+                return 'Remote server-side capture setup did not complete.'
+            }
+            if ($singleLine -match '(?i)cannot find the computer') {
+                return 'WinRM/Kerberos could not find the target as an Active Directory computer.'
+            }
+            if ($singleLine -match '(?i)server name cannot be resolved') {
+                return 'WinRM could not resolve the capture target.'
+            }
+            if ($singleLine -match '(?i)client cannot connect|actively refused') {
+                return 'WinRM is not available on the capture target.'
+            }
+            if ($singleLine -match '(?i)access is denied|unauthorized') {
+                return 'The remoting identity was not authorized for server-side capture.'
+            }
+            if ($singleLine.Length -gt 300) {
+                return $singleLine.Substring(0, 297) + '...'
+            }
+            return $singleLine
+        }
+
+        function Convert-DnsCaptureDiagnostics {
+            param([Parameter(Mandatory)]$Capture)
+            return [pscustomobject]@{
+                ComputerName         = $Capture.ComputerName
+                LocalAddress         = $Capture.LocalAddress
+                PeerAddress          = $Capture.PeerAddress
+                AdapterName          = $Capture.AdapterName
+                DeviceName           = $Capture.DeviceName
+                Filter               = $Capture.Filter
+                NpcapVersion         = $Capture.NpcapVersion
+                TimestampSource      = $Capture.TimestampSource
+                CaptureStartUtc      = $Capture.CaptureStartUtc
+                CaptureEndUtc        = $Capture.CaptureEndUtc
+                ParsedPackets        = [long]$Capture.ParsedPackets
+                QueryPackets         = [long]$Capture.QueryPackets
+                ResponsePackets      = [long]$Capture.ResponsePackets
+                CompletedPairs       = [long]$Capture.CompletedPairs
+                UnmatchedQueries     = [long]$Capture.UnmatchedQueries
+                UnmatchedResponses   = [long]$Capture.UnmatchedResponses
+                PcapReceived         = [long]$Capture.PcapReceived
+                PcapDropped          = [long]$Capture.PcapDropped
+                InterfaceDropped     = [long]$Capture.InterfaceDropped
+                StatisticsAvailable  = [bool]$Capture.StatisticsAvailable
+                PacketLimitReached   = [bool]$Capture.PacketLimitReached
+            }
         }
 
         function Format-FixedText {
@@ -3128,9 +6370,43 @@ namespace DnsPerformanceV353
             return ([double]$Value).ToString($Pattern, [CultureInfo]::InvariantCulture)
         }
 
+        function Format-SignedMetricNumber {
+            param($Value)
+            if ($null -eq $Value) { return '-' }
+            return ([double]$Value).ToString(
+                '+0.000;-0.000;0.000', [CultureInfo]::InvariantCulture)
+        }
+
+        function Format-AverageExcessShare {
+            param($OutboundMetric, $ReturnMetric, [int]$Width = 18)
+
+            if ($null -eq $OutboundMetric -or $null -eq $ReturnMetric -or
+                $OutboundMetric.Count -le 0 -or $ReturnMetric.Count -le 0) {
+                return (Format-CenteredText -Value '-' -Width $Width)
+            }
+            $outboundPositive = [Math]::Max(
+                0.0, [double]$OutboundMetric.AverageMs)
+            $returnPositive = [Math]::Max(
+                0.0, [double]$ReturnMetric.AverageMs)
+            $totalPositive = $outboundPositive + $returnPositive
+            if ($totalPositive -le 0.0) {
+                return (Format-CenteredText -Value 'NO POSITIVE EXCESS' `
+                    -Width $Width)
+            }
+            $outboundPercent = [int][Math]::Round(
+                100.0 * $outboundPositive / $totalPositive,
+                0, [MidpointRounding]::AwayFromZero)
+            $returnPercent = 100 - $outboundPercent
+            $shareText = 'OUT {0}% / RET {1}%' -f @(
+                $outboundPercent
+                $returnPercent
+            )
+            return (Format-CenteredText -Value $shareText -Width $Width)
+        }
+
         function Convert-MetricSnapshot {
             param(
-                [Parameter(Mandatory)][DnsPerformanceV353.MetricSnapshot]$Metric,
+                [Parameter(Mandatory)][DnsPerformanceV420.MetricSnapshot]$Metric,
                 [string]$NameProperty,
                 [string]$Name,
                 [string]$Address,
@@ -3156,8 +6432,8 @@ namespace DnsPerformanceV353
 
         function Get-DashboardLines {
             param(
-                [Parameter(Mandatory)][DnsPerformanceV353.LiveSnapshot]$Snapshot,
-                [Parameter(Mandatory)][DnsPerformanceV353.RunnerProgress]$Progress,
+                [Parameter(Mandatory)][DnsPerformanceV420.LiveSnapshot]$Snapshot,
+                [Parameter(Mandatory)][DnsPerformanceV420.RunnerProgress]$Progress,
                 [Parameter(Mandatory)][string[]]$Names,
                 [Parameter(Mandatory)][int]$TargetAggregateQps,
                 [Parameter(Mandatory)][int]$PerServerQps,
@@ -3313,7 +6589,7 @@ namespace DnsPerformanceV353
 
             $nameHeader = if ($NameProperty -eq 'DNS_Server') { 'DNS SERVER' } else { $NameProperty -replace '_',' ' }
             $longestName = [Math]::Max(18, $nameHeader.Length)
-            foreach ($row in @($Rows)) {
+            foreach ($row in $Rows) {
                 $candidateText = [string]($row.$NameProperty)
                 $candidateLength = $candidateText.Length
                 if ($candidateLength -gt $longestName) { $longestName = $candidateLength }
@@ -3718,20 +6994,73 @@ namespace DnsPerformanceV353
 
             Write-Host ''
             Write-Host 'INTERPRETATION NOTES' -ForegroundColor Cyan
-            Write-Host ('Objectives per server x FQDN: success >=99.9%; successful socket-observed latency <{0:0.##} ms >=99%; <{1:0.##} ms >=99.9%.' -f @(
+            if ($Summary.CoordinatedCapture.Enabled) {
+                Write-Host 'Packet timing: client packet-observed latency runs from the client request packet to the client response packet and excludes client parsing and processing.' -ForegroundColor Gray
+                Write-Host 'Packet timing: combined network time is client packet-observed latency minus server packet turnaround, so it contains outbound and return network time together.' -ForegroundColor Gray
+                Write-Host 'Packet timing: each duration is calculated on one host, so synchronized client/server clocks are not required.' -ForegroundColor Gray
+                Write-Host 'Directional deltas: positive is slower than the nearby baseline and negative is faster; these are changes, not absolute one-way latency.' -ForegroundColor Gray
+                Write-Host 'Directional deltas: outbound and return percentiles are calculated independently and should not be added together.' -ForegroundColor Gray
+                Write-Host 'Directional deltas: client/server clock values may differ, but their offset must remain stable within the nearby baseline window.' -ForegroundColor Gray
+                Write-Host 'Average excess share: normalizes only positive outbound and return average deltas to 100%; negative values remain visible but do not count as added delay. It is not absolute one-way latency or a trend over the run.' -ForegroundColor Gray
+                if ($Summary.CoordinatedCapture.ClientOnlyEndpointCount -gt 0) {
+                    Write-Host 'Client-only fallback: normal socket-observed timing remains in the ordinary tables and CSV; server turnaround, combined network time, and directional deltas are unavailable.' -ForegroundColor Gray
+                }
+            }
+            if ($Summary.ConditionalForwarding.Enabled) {
+                Write-Host 'Conditional forwarding: no observed forward can mean a cached/local answer; it is not labeled as a forwarding failure.' -ForegroundColor Gray
+            }
+            Write-Host ('Latency objectives: per server x FQDN, success >=99.9%; successful socket-observed latency <{0:0.##} ms >=99%; <{1:0.##} ms >=99.9%.' -f @(
                 $criteria.NormalLatencyThresholdMs
                 $criteria.SevereLatencyThresholdMs
-            ))
-            Write-Host ('Detection: complete {0}s sliding windows plus a full-run check, evaluated every 1s with at least {1} violations/objective.' -f @(
+            )) -ForegroundColor Gray
+            Write-Host ('Degradation detection: complete {0}s sliding windows plus a full-run check, evaluated every 1s with at least {1} violations/objective.' -f @(
                 $criteria.WindowSeconds
                 $criteria.MinimumViolations
-            ))
+            )) -ForegroundColor Gray
             Write-Host ('Observer correlation: client processing or parser queue >= {0:0.###} ms; scheduler misses or late rounds also count as evidence.' -f @(
                 $criteria.ObserverProcessingThresholdMs
-            ))
-            Write-Host 'Impact counts query failures plus successful responses of at least 10 ms; evaluated is the query count in qualifying buckets.'
-            Write-Host 'The 10-49 ms and 50+ ms buckets are mutually exclusive; active time ends when a complete one-second bucket is clean.'
-            Write-Host 'Scope and overlap describe measured timing only; neither claims a DNS, server, security, load-balancer, or network root cause.'
+            )) -ForegroundColor Gray
+            Write-Host 'Impact accounting: counts query failures plus successful responses of at least 10 ms; evaluated is the query count in qualifying buckets.' -ForegroundColor Gray
+            Write-Host 'Incident timing: the 10-49 ms and 50+ ms buckets are mutually exclusive; active time ends when a complete one-second bucket is clean.' -ForegroundColor Gray
+            Write-Host 'Scope and overlap: describe measured timing only; neither claims a DNS, server, security, load-balancer, or network root cause.' -ForegroundColor Gray
+        }
+
+        function Write-OutputSummary {
+            param([Parameter(Mandatory)]$Summary)
+
+            if (-not $Summary.CsvOutputPath) { return }
+
+            Write-Host ''
+            Write-Host 'OUTPUT' -ForegroundColor Cyan
+            Write-Host ('Detailed CSV: ' + $Summary.CsvOutputPath)
+
+            if ($Summary.CoordinatedCapture.Enabled -and
+                $null -ne $Summary.CoordinatedCapture.CsvEnrichment) {
+                $enrichment = $Summary.CoordinatedCapture.CsvEnrichment
+                if ($enrichment.Status -eq 'Complete') {
+                    if ($enrichment.ClientOnlyRows -gt 0) {
+                        Write-Host ('Packet timing enrichment: Complete   Coordinated: {0:n0}   Client-only: {1:n0}   Unmatched: {2:n0}   Total: {3:n0}' -f @(
+                            $enrichment.MatchedRows
+                            $enrichment.ClientOnlyRows
+                            $enrichment.UnmatchedRows
+                            $enrichment.TotalRows
+                        ))
+                    } else {
+                        Write-Host ('Packet timing enrichment: Complete   Matched rows: {0:n0}/{1:n0}' -f @(
+                            $enrichment.MatchedRows
+                            $enrichment.TotalRows
+                        ))
+                    }
+                } elseif ($enrichment.Status -eq 'Failed') {
+                    $failureText = 'Packet timing enrichment: Failed'
+                    if (-not [string]::IsNullOrWhiteSpace([string]$enrichment.ErrorMessage)) {
+                        $failureText += '   ' + $enrichment.ErrorMessage
+                    }
+                    Write-Host $failureText -ForegroundColor Yellow
+                } else {
+                    Write-Host ('Packet timing enrichment: ' + $enrichment.Status)
+                }
+            }
         }
 
         function Write-FinalSummary {
@@ -3803,6 +7132,290 @@ namespace DnsPerformanceV353
             Write-ObserverHealth -Summary $Summary
 
             Write-MetricTable -Title 'PER-SERVER SUMMARY' -Rows $Summary.PerServerMetrics -NameProperty 'DNS_Server' -NameWidth 40
+            if ($Summary.CoordinatedCapture.Enabled) {
+                Write-Host ''
+                Write-Host 'COORDINATED PACKET TIMING (UDP/53)' -ForegroundColor Cyan
+                Write-Host ('Status: {0}   Coordinated: {1:n0}   Client-only: {2:n0}   Matched pairs: {3:n0}   TCP fallbacks excluded: {4:n0}' -f @(
+                    $Summary.CoordinatedCapture.Status
+                    $Summary.CoordinatedCapture.CoordinatedEndpointCount
+                    $Summary.CoordinatedCapture.ClientOnlyEndpointCount
+                    $Summary.CoordinatedCapture.MatchedPairs
+                    $Summary.CoordinatedCapture.TcpFallbackPairsExcluded
+                ))
+                $captureIdentityHeader = ('{0,-18} {1,10} {2,8}' -f @(
+                    'DNS SERVER'
+                    'MATCHED'
+                    'COVER%'
+                ))
+                $captureMetricHeader = ('{0,9} {1,9} {2,10}' -f @(
+                    'AVG MS'
+                    'STD MS'
+                    'P95 MS'
+                ))
+                $captureStatusHeader = Format-CenteredText 'STATUS' 12
+                $captureGroupHeader = @(
+                    ''.PadRight($captureIdentityHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'CLIENT PACKET-OBSERVED LATENCY' $captureMetricHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'SERVER PACKET TURNAROUND' $captureMetricHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'COMBINED NETWORK TIME' $captureMetricHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'EVIDENCE' $captureStatusHeader.Length)
+                ) -join ''
+                $captureColumnHeader = @(
+                    $captureIdentityHeader
+                    ' | '
+                    $captureMetricHeader
+                    ' | '
+                    $captureMetricHeader
+                    ' | '
+                    $captureMetricHeader
+                    ' | '
+                    $captureStatusHeader
+                ) -join ''
+                Write-Host $captureGroupHeader -ForegroundColor White
+                Write-Host $captureColumnHeader -ForegroundColor White
+                Write-Host ('-' * $captureColumnHeader.Length) -ForegroundColor DarkGray
+                foreach ($endpoint in $Summary.CoordinatedCapture.Endpoints) {
+                    $isClientOnly = $endpoint.Status -eq 'ClientOnly'
+                    $matchedDisplay = if ($isClientOnly) {
+                        '-'
+                    } else { '{0:n0}' -f $endpoint.MatchedPairs }
+                    $coverageDisplay = if ($isClientOnly) {
+                        '-'
+                    } else { '{0:0.000}' -f $endpoint.CoveragePercent }
+                    $captureIdentity = ('{0,-18} {1,10} {2,8}' -f @(
+                        (Format-FixedText (Get-ShortServerName $endpoint.DNS_Server) 18)
+                        $matchedDisplay
+                        $coverageDisplay
+                    ))
+                    if ($isClientOnly) {
+                        $clientRoundTrip = Format-CenteredText '-' $captureMetricHeader.Length
+                        $serverTurnaround = Format-CenteredText '-' $captureMetricHeader.Length
+                        $combinedNetwork = Format-CenteredText '-' $captureMetricHeader.Length
+                    } else {
+                        $clientRoundTrip = ('{0,9} {1,9} {2,10}' -f @(
+                            (Format-MetricNumber $endpoint.ClientWire.AverageMs '0.000')
+                            (Format-MetricNumber $endpoint.ClientWire.StandardDeviationMs '0.000')
+                            (Format-MetricNumber $endpoint.ClientWire.P95Ms '0.000')
+                        ))
+                        $serverTurnaround = ('{0,9} {1,9} {2,10}' -f @(
+                            (Format-MetricNumber $endpoint.ServerTurnaround.AverageMs '0.000')
+                            (Format-MetricNumber $endpoint.ServerTurnaround.StandardDeviationMs '0.000')
+                            (Format-MetricNumber $endpoint.ServerTurnaround.P95Ms '0.000')
+                        ))
+                        $combinedNetwork = ('{0,9} {1,9} {2,10}' -f @(
+                            (Format-MetricNumber $endpoint.NetworkRemainder.AverageMs '0.000')
+                            (Format-MetricNumber $endpoint.NetworkRemainder.StandardDeviationMs '0.000')
+                            (Format-MetricNumber $endpoint.NetworkRemainder.P95Ms '0.000')
+                        ))
+                    }
+                    Write-Host (@(
+                        $captureIdentity
+                        ' | '
+                        $clientRoundTrip
+                        ' | '
+                        $serverTurnaround
+                        ' | '
+                        $combinedNetwork
+                        ' | '
+                        (Format-CenteredText $endpoint.Status $captureStatusHeader.Length)
+                    ) -join '')
+                }
+                foreach ($fallback in @($Summary.CoordinatedCapture.Fallbacks)) {
+                    Write-Host ('Capture fallback: ' + $fallback) -ForegroundColor Yellow
+                }
+                if ($Summary.CoordinatedCapture.Issues.Count -gt 0) {
+                    foreach ($issue in $Summary.CoordinatedCapture.Issues) {
+                        Write-Host ('Capture issue: ' + $issue) -ForegroundColor Yellow
+                    }
+                }
+
+                Write-Host ''
+                Write-Host 'DIRECTIONAL DELAY CHANGE VS NEARBY BASELINE (MS)' -ForegroundColor Cyan
+                $directionalIdentityHeader = ('{0,-18}' -f 'DNS SERVER')
+                $directionalMetricHeader = ('{0,9} {1,9} {2,9} {3,9}' -f @(
+                    'AVG MS'
+                    'STD MS'
+                    'P95 MS'
+                    'MAX MS'
+                ))
+                $directionalInterpretationHeader =
+                    Format-CenteredText 'AVG EXCESS SHARE' 18
+                $directionalGroupHeader = @(
+                    ''.PadRight($directionalIdentityHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'OUTBOUND DELAY DELTA' $directionalMetricHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'RETURN DELAY DELTA' $directionalMetricHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'INTERPRETATION' $directionalInterpretationHeader.Length)
+                ) -join ''
+                $directionalColumnHeader = @(
+                    $directionalIdentityHeader
+                    ' | '
+                    $directionalMetricHeader
+                    ' | '
+                    $directionalMetricHeader
+                    ' | '
+                    $directionalInterpretationHeader
+                ) -join ''
+                Write-Host $directionalGroupHeader -ForegroundColor White
+                Write-Host $directionalColumnHeader -ForegroundColor White
+                Write-Host ('-' * $directionalColumnHeader.Length) -ForegroundColor DarkGray
+                foreach ($endpoint in $Summary.CoordinatedCapture.Endpoints) {
+                    $outboundDelta = if ($null -ne $endpoint.OutboundDelayDelta -and
+                        $endpoint.OutboundDelayDelta.Count -gt 0) {
+                        '{0,9} {1,9} {2,9} {3,9}' -f @(
+                            (Format-SignedMetricNumber $endpoint.OutboundDelayDelta.AverageMs)
+                            (Format-MetricNumber $endpoint.OutboundDelayDelta.StandardDeviationMs '0.000')
+                            (Format-SignedMetricNumber $endpoint.OutboundDelayDelta.P95Ms)
+                            (Format-SignedMetricNumber $endpoint.OutboundDelayDelta.MaximumMs)
+                        )
+                    } else {
+                        Format-CenteredText '-' $directionalMetricHeader.Length
+                    }
+                    $returnDelta = if ($null -ne $endpoint.ReturnDelayDelta -and
+                        $endpoint.ReturnDelayDelta.Count -gt 0) {
+                        '{0,9} {1,9} {2,9} {3,9}' -f @(
+                            (Format-SignedMetricNumber $endpoint.ReturnDelayDelta.AverageMs)
+                            (Format-MetricNumber $endpoint.ReturnDelayDelta.StandardDeviationMs '0.000')
+                            (Format-SignedMetricNumber $endpoint.ReturnDelayDelta.P95Ms)
+                            (Format-SignedMetricNumber $endpoint.ReturnDelayDelta.MaximumMs)
+                        )
+                    } else {
+                        Format-CenteredText '-' $directionalMetricHeader.Length
+                    }
+                    $averageExcessShare = Format-AverageExcessShare `
+                        -OutboundMetric $endpoint.OutboundDelayDelta `
+                        -ReturnMetric $endpoint.ReturnDelayDelta `
+                        -Width $directionalInterpretationHeader.Length
+                    Write-Host (@(
+                        ('{0,-18}' -f (Format-FixedText (Get-ShortServerName $endpoint.DNS_Server) 18))
+                        ' | '
+                        $outboundDelta
+                        ' | '
+                        $returnDelta
+                        ' | '
+                        $averageExcessShare
+                    ) -join '')
+                }
+            }
+            if ($Summary.ConditionalForwarding.Enabled) {
+                Write-Host ''
+                Write-Host 'CONDITIONAL FORWARDING TRACE' -ForegroundColor Cyan
+                Write-Host ('Status: {0}   Cache changes: none' -f
+                    $Summary.ConditionalForwarding.Status)
+                $forwardingIdentityHeader = ('{0,-18} {1,9}' -f @(
+                    'DNS SERVER'
+                    'FLIGHTS'
+                ))
+                $forwardingOutcomeHeader = ('{0,9} {1,8} {2,9} {3,10}' -f @(
+                    'FALLBACK'
+                    'FAILED'
+                    'NO FWD'
+                    'COALESCED'
+                ))
+                $forwardingLatencyHeader = ('{0,9} {1,9}' -f 'AVG MS','P95 MS')
+                $forwardingStatusHeader = Format-CenteredText 'STATUS' 12
+                $forwardingGroupHeader = @(
+                    ''.PadRight($forwardingIdentityHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'FORWARDING OUTCOMES' $forwardingOutcomeHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'FORWARD DURATION' $forwardingLatencyHeader.Length)
+                    ' | '
+                    (Format-CenteredText 'EVIDENCE' $forwardingStatusHeader.Length)
+                ) -join ''
+                $forwardingColumnHeader = @(
+                    $forwardingIdentityHeader
+                    ' | '
+                    $forwardingOutcomeHeader
+                    ' | '
+                    $forwardingLatencyHeader
+                    ' | '
+                    $forwardingStatusHeader
+                ) -join ''
+                Write-Host $forwardingGroupHeader -ForegroundColor White
+                Write-Host $forwardingColumnHeader -ForegroundColor White
+                Write-Host ('-' * $forwardingColumnHeader.Length) -ForegroundColor DarkGray
+                foreach ($endpoint in $Summary.ConditionalForwarding.Endpoints) {
+                    $analysis = $endpoint.Analysis
+                    if ($endpoint.Status -eq 'ClientOnly') {
+                        $forwardingIdentity = ('{0,-18} {1,9}' -f @(
+                            (Format-FixedText (Get-ShortServerName $endpoint.DNS_Server) 18)
+                            '-'
+                        ))
+                        $forwardingOutcomes =
+                            Format-CenteredText '-' $forwardingOutcomeHeader.Length
+                        $forwardingLatency =
+                            Format-CenteredText '-' $forwardingLatencyHeader.Length
+                    } else {
+                        $forwardingIdentity = ('{0,-18} {1,9:n0}' -f @(
+                            (Format-FixedText (Get-ShortServerName $endpoint.DNS_Server) 18)
+                            $(if ($null -ne $analysis) { $analysis.TotalFlights } else { 0 })
+                        ))
+                        $forwardingOutcomes = ('{0,9:n0} {1,8:n0} {2,9:n0} {3,10:n0}' -f @(
+                            $(if ($null -ne $analysis) { $analysis.FlightsUsingDifferentMaster } else { 0 })
+                            $(if ($null -ne $analysis) { $analysis.FailedFlights } else { 0 })
+                            $(if ($null -ne $analysis) { $analysis.ClientTransactionsWithoutObservedForwarding } else { 0 })
+                            $(if ($null -ne $analysis) { $analysis.CoalescedClientQueries } else { 0 })
+                        ))
+                        $forwardingLatency = if ($null -ne $analysis -and
+                            $analysis.ForwardingDuration.Count -gt 0) {
+                            '{0,9} {1,9}' -f @(
+                                (Format-MetricNumber $analysis.ForwardingDuration.AverageMs '0.000')
+                                (Format-MetricNumber $analysis.ForwardingDuration.P95Ms '0.000')
+                            )
+                        } else {
+                            Format-CenteredText '-' $forwardingLatencyHeader.Length
+                        }
+                    }
+                    Write-Host (@(
+                        $forwardingIdentity
+                        ' | '
+                        $forwardingOutcomes
+                        ' | '
+                        $forwardingLatency
+                        ' | '
+                        (Format-CenteredText $endpoint.Status $forwardingStatusHeader.Length)
+                    ) -join '')
+                }
+                $notableFlights = @($Summary.ConditionalForwarding.Endpoints |
+                    Where-Object { $null -ne $_.Analysis } |
+                    ForEach-Object {
+                        $serverName = $_.DNS_Server
+                        @($_.Analysis.Flights) | Where-Object {
+                            $_.DifferentMasterFallbackUsed -or
+                            $_.Status -in @('FailedResponse','NoResponse')
+                        } | ForEach-Object {
+                            [pscustomobject]@{ Server = $serverName; Flight = $_ }
+                        }
+                    } | Select-Object -First 10)
+                if ($notableFlights.Count -gt 0) {
+                    Write-Host 'Notable retained flights:' -ForegroundColor DarkGray
+                    foreach ($item in $notableFlights) {
+                        $path = @($item.Flight.Attempts | ForEach-Object {
+                            '{0}({1})' -f $_.TargetAddress, $_.Outcome
+                        }) -join ' -> '
+                        Write-Host ('  {0}  {1}  {2}  {3} ms  {4}' -f @(
+                            (Get-ShortServerName $item.Server)
+                            $item.Flight.QueryName
+                            $item.Flight.Status
+                            (Format-MetricNumber $item.Flight.ForwardingDurationMs '0.000')
+                            $path
+                        ))
+                    }
+                }
+                foreach ($fallback in @($Summary.ConditionalForwarding.Fallbacks)) {
+                    Write-Host ('Forwarding trace fallback: ' + $fallback) -ForegroundColor Yellow
+                }
+                foreach ($issue in $Summary.ConditionalForwarding.Issues) {
+                    Write-Host ('Forwarding trace issue: ' + $issue) -ForegroundColor Yellow
+                }
+            }
             Write-MetricTable -Title 'PER-FQDN SUMMARY' -Rows $Summary.PerFQDNMetrics -NameProperty 'FQDN' -NameWidth 45
             $latencyMatrixParameters = @{
                 Title         = 'SERVER x FQDN LATENCY'
@@ -3821,8 +7434,8 @@ namespace DnsPerformanceV353
                 Mode          = 'P99Success'
             }
             Write-CellMatrix @tailMatrixParameters
-            if ($Summary.CsvOutputPath) { Write-Host ''; Write-Host ('Detailed CSV: ' + $Summary.CsvOutputPath) }
             Write-DegradationTable -Summary $Summary
+            Write-OutputSummary -Summary $Summary
         }
     }
 
@@ -3830,12 +7443,13 @@ namespace DnsPerformanceV353
         $normalizedNames = New-Object 'System.Collections.Generic.List[string]'
         $nameSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($name in $FQDNs) {
-            try { $normalized = [DnsPerformanceV353.DnsWire]::NormalizeName($name) }
+            try { $normalized = [DnsPerformanceV420.DnsWire]::NormalizeName($name) }
             catch { throw "Invalid FQDN '$name': $($_.Exception.Message)" }
             if ($nameSet.Add($normalized)) { $normalizedNames.Add($normalized) }
         }
 
-        $targets = New-Object 'System.Collections.Generic.List[DnsPerformanceV353.DnsTarget]'
+        $targets = New-Object 'System.Collections.Generic.List[DnsPerformanceV420.DnsTarget]'
+        $captureEndpointDefinitions = New-Object 'System.Collections.Generic.List[object]'
         $targetSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($server in $DNSServers) {
             $addresses = @()
@@ -3850,11 +7464,32 @@ namespace DnsPerformanceV353
                 $addressText = $address.ToString()
                 if (-not $targetSet.Add($addressText)) { continue }
                 $label = if ($addresses.Count -gt 1) { "$server [$addressText]" } else { $server }
-                $targets.Add((New-Object DnsPerformanceV353.DnsTarget -ArgumentList $label, $addressText))
+                $targets.Add((New-Object DnsPerformanceV420.DnsTarget -ArgumentList $label, $addressText))
+                $captureComputer = $server
+                if ($null -ne $CaptureComputerMap) {
+                    foreach ($mappingKey in @($addressText, $label, $server)) {
+                        if ($CaptureComputerMap.ContainsKey($mappingKey)) {
+                            $captureComputer = [string]$CaptureComputerMap[$mappingKey]
+                            break
+                        }
+                    }
+                }
+                if ([string]::IsNullOrWhiteSpace($captureComputer)) {
+                    throw "CaptureComputerMap resolved '$label' to an empty remoting computer name."
+                }
+                $captureEndpointDefinitions.Add([pscustomobject]@{
+                    Label           = $label
+                    Address         = $addressText
+                    OriginalServer  = $server
+                    CaptureComputer = $captureComputer
+                })
             }
         }
         if ($targets.Count -eq 0) { throw 'No unique DNS server endpoints remain after resolution.' }
         if ($targets.Count -gt 64) { throw 'A maximum of 64 resolved DNS endpoints is supported.' }
+        if ($CoordinatedCapture -and $targets.Count -gt 16) {
+            throw 'CoordinatedCapture supports a maximum of 16 resolved DNS endpoints per run.'
+        }
 
         $aggregateQps64 = [long]$QueriesPerSecond * $targets.Count
         if ($aggregateQps64 -gt [int]::MaxValue) { throw 'The target aggregate QPS exceeds the supported integer range.' }
@@ -3886,7 +7521,7 @@ namespace DnsPerformanceV353
             }
         }
 
-        $options = New-Object DnsPerformanceV353.RunnerOptions
+        $options = New-Object DnsPerformanceV420.RunnerOptions
         $options.QueriesPerSecondPerServer = $QueriesPerSecond
         $options.DurationSeconds = $DurationSeconds
         $options.TimeoutMilliseconds = $TimeoutMilliseconds
@@ -3907,19 +7542,67 @@ namespace DnsPerformanceV353
         $options.WarmupSeconds = $WarmupSeconds
         $options.ProcessingWorkerCount = $ProcessingWorkerCount
         $options.ObserverProcessingThresholdMs = $ObserverProcessingThresholdMilliseconds
+        $options.WaitForMeasurementRelease = [bool]$CoordinatedCapture
 
-        $queryTypeCode = [DnsPerformanceV353.DnsWire]::GetQueryTypeCode($QueryType)
-        $runner = [DnsPerformanceV353.DnsLoadRunner]::Create(
+        $queryTypeCode = [DnsPerformanceV420.DnsWire]::GetQueryTypeCode($QueryType)
+        $runner = [DnsPerformanceV420.DnsLoadRunner]::Create(
             $targets.ToArray(), $normalizedNames.ToArray(), $queryTypeCode, $options)
         $cancellation = New-Object System.Threading.CancellationTokenSource
         $runnerTask = $null
         $completion = $null
         $finalSnapshot = $null
+        $captureStates = New-Object 'System.Collections.Generic.List[object]'
+        $clientOnlyCaptureDefinitions =
+            New-Object 'System.Collections.Generic.List[object]'
+        $captureArmed = $false
+        $csvPacketTimingEnrichment = [pscustomobject]@{
+            Status        = if ($resolvedCsvPath -and $CoordinatedCapture) { 'Pending' } else { 'NotRequested' }
+            TotalRows     = 0L
+            MatchedRows   = 0L
+            ClientOnlyRows = 0L
+            UnmatchedRows = 0L
+            NotSentRows   = 0L
+            TcpFallbackRows = 0L
+            DirectionalDeltaMethod = $null
+            ErrorMessage  = $null
+        }
+        $coordinatedCaptureSummary = [pscustomobject]@{
+            Enabled                     = [bool]$CoordinatedCapture
+            Status                      = if ($CoordinatedCapture) { 'Preparing' } else { 'NotRequested' }
+            Scope                       = 'UDP port 53 request/response pairs'
+            TimestampSource             = if ($CoordinatedCapture) { 'Npcap default host timestamp (microsecond representation)' } else { $null }
+            TcpFallbackPairsExcluded    = 0L
+            MatchedPairs                = 0L
+            CoordinatedEndpointCount    = 0
+            ClientOnlyEndpointCount     = 0
+            CsvEnrichment               = $csvPacketTimingEnrichment
+            Endpoints                   = @()
+            Fallbacks                   = @()
+            Issues                      = @()
+        }
+        $conditionalForwardingSummary = [pscustomobject]@{
+            Enabled                     = [bool]$TraceConditionalForwarding
+            Status                      = if ($TraceConditionalForwarding) { 'Preparing' } else { 'NotRequested' }
+            Scope                       = 'Tested DNS questions sent between each DNS server and its matching conditional-forwarder masters'
+            CacheMutation               = 'None'
+            Endpoints                   = @()
+            Fallbacks                   = @()
+            Issues                      = @()
+        }
         $isIse = ($Host.Name -eq 'Windows PowerShell ISE Host') -or ($null -ne (Get-Variable psISE -Scope Global -ErrorAction SilentlyContinue))
         $outputRedirected = $false
+        $inputRedirected = $false
+        $executionError = $null
         try {
-            if (-not $isIse) { $outputRedirected = [Console]::IsOutputRedirected }
+            if (-not $isIse) {
+                $outputRedirected = [Console]::IsOutputRedirected
+                $inputRedirected = [Console]::IsInputRedirected
+            }
         } catch { }
+        $credentialPromptAvailable = [Environment]::UserInteractive -and
+            ($isIse -or -not $inputRedirected)
+        $effectiveCaptureCredential = $CaptureCredential
+        $captureCredentialPrompted = $false
         $dashboardRenderingMode = if ($isIse -or ($Host.Name -eq 'ConsoleHost' -and -not $outputRedirected)) {
             'Redraw'
         } else {
@@ -3927,6 +7610,285 @@ namespace DnsPerformanceV353
         }
 
         try {
+            if ($CoordinatedCapture) {
+                if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+                    throw 'CoordinatedCapture requires Windows on the test client.'
+                }
+                $estimatedPacketsPerEndpoint = 2L * [long]$QueriesPerSecond * [long]$DurationSeconds
+                if ($estimatedPacketsPerEndpoint -gt $CaptureMaximumPacketsPerEndpoint) {
+                    Write-Warning ("A fully answered run can produce approximately {0:n0} UDP packets per endpoint, above CaptureMaximumPacketsPerEndpoint ({1:n0}). Coordinated evidence may be incomplete." -f @(
+                        $estimatedPacketsPerEndpoint
+                        $CaptureMaximumPacketsPerEndpoint
+                    ))
+                }
+                if ($TraceConditionalForwarding) {
+                    $estimatedForwardingPacketsPerEndpoint =
+                        6L * [long]$QueriesPerSecond * [long]$DurationSeconds
+                    if ($estimatedForwardingPacketsPerEndpoint -gt
+                        $CaptureMaximumForwardingPacketsPerEndpoint) {
+                        Write-Warning ("If every client query is a cache miss and uses one fully observed fallback, the conditional-forwarding trace can observe approximately {0:n0} client/upstream DNS packets per endpoint, above CaptureMaximumForwardingPacketsPerEndpoint ({1:n0}). Trace evidence may be incomplete." -f @(
+                            $estimatedForwardingPacketsPerEndpoint
+                            $CaptureMaximumForwardingPacketsPerEndpoint
+                        ))
+                    }
+                }
+                Write-Host ('Preparing coordinated Npcap capture for {0} DNS endpoint(s)...' -f $targets.Count) -ForegroundColor Cyan
+                foreach ($definition in $captureEndpointDefinitions) {
+                    $endpointSetupTimer = [Diagnostics.Stopwatch]::StartNew()
+                    $captureDurationSeconds = $DurationSeconds +
+                        [int][Math]::Ceiling($TimeoutMilliseconds / 1000.0) + $CaptureGraceSeconds
+                    $clientAddress = Get-DnsCaptureSourceAddress `
+                        -PeerAddress $definition.Address
+                    $localCaptureProbe = $null
+                    try {
+                        $localCaptureProbe =
+                            [DnsCoordinatedCaptureV424.CaptureRunner]::Open(
+                                $clientAddress, $definition.Address, 64, 1, 1)
+                        if ($null -eq $localCaptureProbe.ReadyInfo) {
+                            throw 'Local Npcap access verification returned no readiness record.'
+                        }
+                    } catch {
+                        throw "Client Npcap preflight failed for $($definition.Label) [$($definition.Address)]: $($_.Exception.Message)"
+                    } finally {
+                        if ($null -ne $localCaptureProbe) {
+                            $localCaptureProbe.Dispose()
+                        }
+                    }
+                    $preflightScript = {
+                        param($TypeDefinition, $ForwardingTypeDefinition, $TraceForwarding,
+                            $ServerAddress, $ClientAddress)
+                        $npcapDirectory = if ([Environment]::Is64BitProcess) {
+                            Join-Path $env:SystemRoot 'System32\Npcap'
+                        } else {
+                            Join-Path $env:SystemRoot 'SysWOW64\Npcap'
+                        }
+                        if (-not [IO.Directory]::Exists($npcapDirectory)) {
+                            throw "Npcap runtime directory was not found: $npcapDirectory"
+                        }
+                        if (($env:Path -split ';') -notcontains $npcapDirectory) {
+                            $env:Path = $npcapDirectory + ';' + $env:Path
+                        }
+                        if (-not ('DnsCoordinatedCaptureV424.CaptureRunner' -as [type])) {
+                            Add-Type -Language CSharp -ErrorAction Stop -TypeDefinition $TypeDefinition
+                        }
+                        $captureProbe = $null
+                        try {
+                            $captureProbe =
+                                [DnsCoordinatedCaptureV424.CaptureRunner]::Open(
+                                    $ServerAddress, $ClientAddress, 64, 1, 1)
+                            $captureProbeReady = $captureProbe.ReadyInfo
+                            if ($null -eq $captureProbeReady) {
+                                throw 'Remote Npcap access verification returned no readiness record.'
+                            }
+                        } finally {
+                            if ($null -ne $captureProbe) { $captureProbe.Dispose() }
+                        }
+                        $conditionalForwarders = @()
+                        if ($TraceForwarding) {
+                            if (-not ('DnsForwardingCaptureV410.ForwardingCaptureRunner' -as [type])) {
+                                Add-Type -Language CSharp -ErrorAction Stop `
+                                    -TypeDefinition $ForwardingTypeDefinition
+                            }
+                            $conditionalForwarders = @(Get-DnsServerZone -ErrorAction Stop |
+                                Where-Object { [string]$_.ZoneType -eq 'Forwarder' } |
+                                ForEach-Object {
+                                    $zoneName = if ($null -ne $_.PSObject.Properties['ZoneName']) {
+                                        [string]$_.ZoneName
+                                    } else { [string]$_.Name }
+                                    [pscustomobject]@{
+                                        ZoneName         = $zoneName.Trim().TrimEnd('.').ToLowerInvariant()
+                                        MasterServers    = @($_.MasterServers | ForEach-Object { $_.ToString() })
+                                        ForwarderTimeout = if ($null -ne $_.PSObject.Properties['ForwarderTimeout']) {
+                                            $_.ForwarderTimeout
+                                        } else { $null }
+                                    }
+                                })
+                        }
+                        [pscustomobject]@{
+                            ComputerName          = $env:COMPUTERNAME
+                            NpcapPath              = $npcapDirectory
+                            HelperLoaded           = $true
+                            CaptureAccessVerified  = $true
+                            CaptureAdapterName     = $captureProbeReady.AdapterName
+                            ConditionalForwarders  = @($conditionalForwarders)
+                        }
+                    }
+
+                    $remoteSession = $null
+                    $preflight = $null
+                    $setupFailureMessage = $null
+                    while ($null -eq $preflight) {
+                        if ($endpointSetupTimer.Elapsed.TotalSeconds -ge
+                            $CaptureStartupTimeoutSeconds) {
+                            $setupFailureMessage =
+                                "Remote capture setup exceeded CaptureStartupTimeoutSeconds ($CaptureStartupTimeoutSeconds)."
+                            break
+                        }
+                        $remainingMilliseconds = [int][Math]::Max(1000, [Math]::Floor(
+                            ($CaptureStartupTimeoutSeconds -
+                                $endpointSetupTimer.Elapsed.TotalSeconds) * 1000.0))
+                        $sessionOptionParameters = @{
+                            OpenTimeout      = $remainingMilliseconds
+                            OperationTimeout = [int][Math]::Min([int]::MaxValue,
+                                ([long]$captureDurationSeconds + 60L) * 1000L)
+                        }
+                        $sessionOptions = New-PSSessionOption @sessionOptionParameters
+                        $sessionParameters = @{
+                            ComputerName  = $definition.CaptureComputer
+                            SessionOption = $sessionOptions
+                            ErrorAction   = 'Stop'
+                        }
+                        if ($null -ne $effectiveCaptureCredential) {
+                            $sessionParameters.Credential = $effectiveCaptureCredential
+                        }
+                        if ($CaptureUseSSL) { $sessionParameters.UseSSL = $true }
+                        try {
+                            $remoteSession = New-PSSession @sessionParameters
+                            $preflightOutput = @(Invoke-Command -Session $remoteSession `
+                                -ScriptBlock $preflightScript -ArgumentList @(
+                                    $coordinatedCaptureTypeDefinition
+                                    $forwardingCaptureTypeDefinition
+                                    [bool]$TraceConditionalForwarding
+                                    $definition.Address
+                                    $clientAddress
+                                ) -ErrorAction Stop)
+                            $preflight = $preflightOutput | Select-Object -Last 1
+                            if ($null -eq $preflight -or
+                                -not $preflight.CaptureAccessVerified) {
+                                throw 'Remote Npcap access verification returned no readiness record.'
+                            }
+                        } catch {
+                            $setupFailure = $_
+                            $setupFailureMessage = $setupFailure.Exception.Message
+                            $preflight = $null
+                            if ($null -ne $remoteSession) {
+                                Remove-PSSession -Session $remoteSession `
+                                    -ErrorAction SilentlyContinue
+                                $remoteSession = $null
+                            }
+                            $isCredentialFailure = Test-DnsCaptureCredentialFailure `
+                                -Message $setupFailureMessage
+                            if ($isCredentialFailure -and
+                                -not $captureCredentialPrompted -and
+                                $credentialPromptAvailable) {
+                                $captureCredentialPrompted = $true
+                                Write-Warning ("Coordinated-capture setup using the current remoting credentials failed on '{0}' for {1}: {2}" -f @(
+                                    $definition.CaptureComputer
+                                    $definition.Label
+                                    $setupFailure.Exception.Message
+                                ))
+                                Write-Host 'Enter alternate credentials to retry, or cancel if the failure is not credential-related.' -ForegroundColor Yellow
+                                $alternateCredential = $null
+                                $endpointSetupTimer.Stop()
+                                try {
+                                    $alternateCredential = Get-Credential -Message `
+                                        ("Credentials for coordinated capture on {0}" -f `
+                                            $definition.CaptureComputer)
+                                } catch { }
+                                finally { $endpointSetupTimer.Start() }
+                                if ($null -ne $alternateCredential) {
+                                    $effectiveCaptureCredential = $alternateCredential
+                                    $setupFailureMessage = $null
+                                    continue
+                                }
+                            }
+                            break
+                        }
+                    }
+
+                    if ($null -eq $preflight) {
+                        if ($null -ne $remoteSession) {
+                            Remove-PSSession -Session $remoteSession `
+                                -ErrorAction SilentlyContinue
+                            $remoteSession = $null
+                        }
+                        $fallbackReason = Get-DnsCaptureFallbackReason `
+                            -Message $setupFailureMessage
+                        $clientOnlyCaptureDefinitions.Add([pscustomobject]@{
+                            Label           = $definition.Label
+                            Address         = $definition.Address
+                            CaptureComputer = $definition.CaptureComputer
+                            Reason          = $fallbackReason
+                        })
+                        Write-Warning ("Server-side capture is unavailable on '{0}' for {1}; continuing with normal client-side timing only. {2}" -f @(
+                            $definition.CaptureComputer
+                            $definition.Label
+                            $fallbackReason
+                        ))
+                        continue
+                    }
+
+                    $state = [pscustomobject]@{
+                        Id             = [Guid]::NewGuid().ToString('N')
+                        Label          = $definition.Label
+                        Address        = $definition.Address
+                        RemoteComputer = $definition.CaptureComputer
+                        ClientAddress  = $clientAddress
+                        Session        = $remoteSession
+                        OpenJob        = $null
+                        RunJob         = $null
+                        LocalSession   = $null
+                        LocalTask      = $null
+                        ClientReady    = $null
+                        ServerReady    = $null
+                        ForwardingReady = $null
+                        ClientResult   = $null
+                        ServerResult   = $null
+                        RemoteCaptureBytes = $null
+                        ConditionalForwarders = @()
+                        ForwardingZoneNames = @()
+                        ForwardingMasterAddresses = @()
+                    }
+                    $captureStates.Add($state)
+                    if ($TraceConditionalForwarding) {
+                        $matchingZones = New-Object 'System.Collections.Generic.List[object]'
+                        $masterAddresses = New-Object 'System.Collections.Generic.List[string]'
+                        $seenMasters = New-Object 'System.Collections.Generic.HashSet[string]' `
+                            ([StringComparer]::OrdinalIgnoreCase)
+                        $seenZones = New-Object 'System.Collections.Generic.HashSet[string]' `
+                            ([StringComparer]::OrdinalIgnoreCase)
+                        foreach ($testName in $normalizedNames) {
+                            $bestZone = $null
+                            foreach ($zone in @($preflight.ConditionalForwarders)) {
+                                $zoneName = [string]$zone.ZoneName
+                                if ($testName -eq $zoneName -or
+                                    $testName.EndsWith('.' + $zoneName,
+                                        [StringComparison]::OrdinalIgnoreCase)) {
+                                    if ($null -eq $bestZone -or
+                                        $zoneName.Length -gt
+                                            ([string]$bestZone.ZoneName).Length) {
+                                        $bestZone = $zone
+                                    }
+                                }
+                            }
+                            if ($null -eq $bestZone -or
+                                -not $seenZones.Add([string]$bestZone.ZoneName)) {
+                                continue
+                            }
+                            $matchingZones.Add([pscustomobject]@{
+                                ZoneName         = [string]$bestZone.ZoneName
+                                MasterServers    = @($bestZone.MasterServers)
+                                ForwarderTimeout = $bestZone.ForwarderTimeout
+                            })
+                            foreach ($master in @($bestZone.MasterServers)) {
+                                $masterText = [string]$master
+                                if ($seenMasters.Add($masterText)) {
+                                    $masterAddresses.Add($masterText)
+                                }
+                            }
+                        }
+                        $state.ConditionalForwarders =
+                            [object[]]($matchingZones.ToArray())
+                        $state.ForwardingZoneNames = [string[]]@(
+                            $matchingZones.ToArray() |
+                                ForEach-Object { $_.ZoneName }
+                        )
+                        $state.ForwardingMasterAddresses =
+                            [string[]]($masterAddresses.ToArray())
+                    }
+                }
+            }
+
             $runnerTask = $runner.RunAsync($cancellation.Token)
             $live = $runner.GetLiveSnapshot($RollingWindowSeconds)
             $dashboardParameters = @{
@@ -3944,6 +7906,220 @@ namespace DnsPerformanceV353
             Show-Dashboard -Lines $lines -Mode $dashboardRenderingMode -IsIse $isIse -ErrorAction Stop
             $displayTimer = [Diagnostics.Stopwatch]::StartNew()
             while (-not $runnerTask.IsCompleted) {
+                if ($CoordinatedCapture -and -not $captureArmed -and
+                    $runner.Progress.Phase -eq 'ARMING') {
+                    $armingTimer = [Diagnostics.Stopwatch]::StartNew()
+                    foreach ($state in $captureStates) {
+                        try {
+                            $state.LocalSession = [DnsCoordinatedCaptureV424.CaptureRunner]::Open(
+                                $state.ClientAddress, $state.Address, 128, 8,
+                                $CaptureMaximumPacketsPerEndpoint)
+                            $state.ClientReady = $state.LocalSession.ReadyInfo
+                        } catch {
+                            throw "Client Npcap capture could not open for $($state.Label) [$($state.Address)]: $($_.Exception.Message)"
+                        }
+                    }
+
+                    $remoteOpenScript = {
+                        param($CaptureId, $ServerAddress, $ClientAddress, $MaximumPackets,
+                            $ForwardingSettings)
+                        if ($null -eq $global:DnsCoordinatedCaptureSessions) {
+                            $global:DnsCoordinatedCaptureSessions = @{}
+                        }
+                        $pairCapture = [DnsCoordinatedCaptureV424.CaptureRunner]::Open(
+                            $ServerAddress, $ClientAddress, 128, 8, $MaximumPackets)
+                        $forwardingCapture = $null
+                        try {
+                            if ($ForwardingSettings.Enabled -and
+                                @($ForwardingSettings.MasterAddresses).Count -gt 0) {
+                                $serverInterface = @(Get-NetIPAddress -IPAddress $ServerAddress `
+                                    -ErrorAction Stop | Select-Object -First 1).InterfaceIndex
+                                $forwardingLocalAddresses =
+                                    New-Object 'System.Collections.Generic.List[string]'
+                                $seenForwardingLocalAddresses =
+                                    New-Object 'System.Collections.Generic.HashSet[string]' `
+                                        ([StringComparer]::OrdinalIgnoreCase)
+                                foreach ($masterAddress in @($ForwardingSettings.MasterAddresses)) {
+                                    $peer = [IPAddress]::Parse([string]$masterAddress)
+                                    $routeSocket = New-Object System.Net.Sockets.Socket @(
+                                        $peer.AddressFamily,
+                                        [System.Net.Sockets.SocketType]::Dgram,
+                                        [System.Net.Sockets.ProtocolType]::Udp
+                                    )
+                                    try {
+                                        $routeSocket.Connect((New-Object System.Net.IPEndPoint `
+                                            -ArgumentList $peer, 53))
+                                        $sourceAddress = ([IPEndPoint]$routeSocket.LocalEndPoint).Address.ToString()
+                                        $sourceInterface = @(Get-NetIPAddress -IPAddress $sourceAddress `
+                                            -ErrorAction Stop | Select-Object -First 1).InterfaceIndex
+                                        if ($sourceInterface -ne $serverInterface) {
+                                            throw "Conditional-forwarder master $masterAddress routes through interface $sourceInterface ($sourceAddress), but the DNS endpoint $ServerAddress is on interface $serverInterface. Multi-adapter forwarding capture is not supported in this revision."
+                                        }
+                                        if ($seenForwardingLocalAddresses.Add($sourceAddress)) {
+                                            $forwardingLocalAddresses.Add($sourceAddress)
+                                        }
+                                    } finally {
+                                        $routeSocket.Dispose()
+                                    }
+                                }
+                                $forwardingCapture =
+                                    [DnsForwardingCaptureV410.ForwardingCaptureRunner]::Open(
+                                        $ServerAddress, $ClientAddress,
+                                        [string[]]($forwardingLocalAddresses.ToArray()),
+                                        [string[]]($ForwardingSettings.MasterAddresses),
+                                        [string[]]($ForwardingSettings.TestNames),
+                                        384, 8, $ForwardingSettings.MaximumPackets)
+                            }
+                            $entry = [pscustomobject]@{
+                                PairCapture       = $pairCapture
+                                ForwardingCapture = $forwardingCapture
+                            }
+                            $global:DnsCoordinatedCaptureSessions[$CaptureId] = $entry
+                            return [pscustomobject]@{
+                                PairReady       = $pairCapture.ReadyInfo
+                                ForwardingReady = if ($null -ne $forwardingCapture) {
+                                    $forwardingCapture.ReadyInfo
+                                } else { $null }
+                            }
+                        } catch {
+                            if ($null -ne $forwardingCapture) {
+                                try { $forwardingCapture.Dispose() } catch { }
+                            }
+                            try { $pairCapture.Dispose() } catch { }
+                            throw
+                        }
+                    }
+                    foreach ($state in $captureStates) {
+                        $forwardingOpenSettings = [pscustomobject]@{
+                            Enabled         = [bool]$TraceConditionalForwarding
+                            MasterAddresses = [string[]]$state.ForwardingMasterAddresses
+                            TestNames       = [string[]]($normalizedNames.ToArray())
+                            MaximumPackets  = $CaptureMaximumForwardingPacketsPerEndpoint
+                        }
+                        $state.OpenJob = Invoke-Command -Session $state.Session -AsJob `
+                            -ScriptBlock $remoteOpenScript -ArgumentList @(
+                                $state.Id, $state.Address, $state.ClientAddress,
+                                $CaptureMaximumPacketsPerEndpoint,
+                                $forwardingOpenSettings) -ErrorAction Stop
+                    }
+                    while (@($captureStates | Where-Object { $_.OpenJob.State -notin @('Completed','Failed','Stopped') }).Count -gt 0) {
+                        if ($armingTimer.Elapsed.TotalSeconds -ge $CaptureStartupTimeoutSeconds) {
+                            throw "Npcap handles did not arm on every endpoint within CaptureStartupTimeoutSeconds ($CaptureStartupTimeoutSeconds)."
+                        }
+                        Start-Sleep -Milliseconds 50
+                    }
+                    foreach ($state in $captureStates) {
+                        if ($state.OpenJob.State -ne 'Completed') {
+                            $reason = if ($null -ne $state.OpenJob.JobStateInfo.Reason) {
+                                $state.OpenJob.JobStateInfo.Reason.Message
+                            } else { 'The remote capture-open job did not complete.' }
+                            throw "Server Npcap capture could not open on '$($state.RemoteComputer)' for $($state.Label): $reason"
+                        }
+                        $readyOutput = @(Receive-Job -Job $state.OpenJob -ErrorAction Stop)
+                        $readyRecord = $readyOutput | Select-Object -Last 1
+                        $state.ServerReady = $readyRecord.PairReady
+                        $state.ForwardingReady = $readyRecord.ForwardingReady
+                        Remove-Job -Job $state.OpenJob -Force -ErrorAction SilentlyContinue
+                        $state.OpenJob = $null
+                        if ($null -eq $state.ServerReady) {
+                            throw "Server Npcap capture on '$($state.RemoteComputer)' returned no readiness record for $($state.Label)."
+                        }
+                    }
+
+                    $remoteRunScript = {
+                        param($CaptureId, $CaptureDurationSeconds)
+                        $entry = $global:DnsCoordinatedCaptureSessions[$CaptureId]
+                        if ($null -eq $entry) { throw "Capture session '$CaptureId' was not found." }
+                        $capture = $entry.PairCapture
+                        $forwardingCapture = $entry.ForwardingCapture
+                        $captureTask = $null
+                        $forwardingTask = $null
+                        try {
+                            $captureTask = $capture.RunAsync($CaptureDurationSeconds)
+                            if ($null -ne $forwardingCapture) {
+                                $forwardingTask = $forwardingCapture.RunAsync($CaptureDurationSeconds)
+                            }
+                            while (-not $captureTask.IsCompleted -or
+                                ($null -ne $forwardingTask -and -not $forwardingTask.IsCompleted)) {
+                                Start-Sleep -Milliseconds 100
+                            }
+                            $result = $captureTask.GetAwaiter().GetResult()
+                            $forwardingResult = if ($null -ne $forwardingTask) {
+                                $forwardingTask.GetAwaiter().GetResult()
+                            } else { $null }
+                            return [pscustomobject]@{
+                                ComputerName          = $result.ComputerName
+                                LocalAddress          = $result.LocalAddress
+                                PeerAddress           = $result.PeerAddress
+                                AdapterName           = $result.AdapterName
+                                DeviceName            = $result.DeviceName
+                                Filter                = $result.Filter
+                                NpcapVersion          = $result.NpcapVersion
+                                TimestampSource       = $result.TimestampSource
+                                CaptureStartUtc       = $result.CaptureStartUtc
+                                CaptureEndUtc         = $result.CaptureEndUtc
+                                ParsedPackets         = $result.ParsedPackets
+                                QueryPackets          = $result.QueryPackets
+                                ResponsePackets       = $result.ResponsePackets
+                                CompletedPairs        = $result.CompletedPairs
+                                UnmatchedQueries      = $result.UnmatchedQueries
+                                UnmatchedResponses    = $result.UnmatchedResponses
+                                PcapReceived          = $result.PcapReceived
+                                PcapDropped           = $result.PcapDropped
+                                InterfaceDropped      = $result.InterfaceDropped
+                                StatisticsAvailable   = $result.StatisticsAvailable
+                                PacketLimitReached    = $result.PacketLimitReached
+                                CompressedPairsBase64 = [Convert]::ToBase64String($result.CompressedPairs)
+                                ForwardingEnabled     = $null -ne $forwardingResult
+                                ForwardingComputerName = if ($null -ne $forwardingResult) { $forwardingResult.ComputerName } else { $null }
+                                ForwardingLocalAddress = if ($null -ne $forwardingResult) { $forwardingResult.LocalAddress } else { $null }
+                                ForwardingClientAddress = if ($null -ne $forwardingResult) { $forwardingResult.ClientAddress } else { $null }
+                                ForwardingLocalAddresses = if ($null -ne $forwardingResult) { @($forwardingResult.ForwardingLocalAddresses) } else { @() }
+                                ForwardingMasterAddresses = if ($null -ne $forwardingResult) { @($forwardingResult.MasterAddresses) } else { @() }
+                                ForwardingAdapterName = if ($null -ne $forwardingResult) { $forwardingResult.AdapterName } else { $null }
+                                ForwardingDeviceName = if ($null -ne $forwardingResult) { $forwardingResult.DeviceName } else { $null }
+                                ForwardingFilter = if ($null -ne $forwardingResult) { $forwardingResult.Filter } else { $null }
+                                ForwardingNpcapVersion = if ($null -ne $forwardingResult) { $forwardingResult.NpcapVersion } else { $null }
+                                ForwardingTimestampSource = if ($null -ne $forwardingResult) { $forwardingResult.TimestampSource } else { $null }
+                                ForwardingCaptureStartUtc = if ($null -ne $forwardingResult) { $forwardingResult.CaptureStartUtc } else { $null }
+                                ForwardingCaptureEndUtc = if ($null -ne $forwardingResult) { $forwardingResult.CaptureEndUtc } else { $null }
+                                ForwardingCapturedPackets = if ($null -ne $forwardingResult) { $forwardingResult.CapturedPackets } else { 0L }
+                                ForwardingParsedDnsPackets = if ($null -ne $forwardingResult) { $forwardingResult.ParsedDnsPackets } else { 0L }
+                                ForwardingRelevantEvents = if ($null -ne $forwardingResult) { $forwardingResult.RelevantEvents } else { 0L }
+                                ForwardingUnparsedDnsPackets = if ($null -ne $forwardingResult) { $forwardingResult.UnparsedDnsPackets } else { 0L }
+                                ForwardingPcapReceived = if ($null -ne $forwardingResult) { $forwardingResult.PcapReceived } else { 0L }
+                                ForwardingPcapDropped = if ($null -ne $forwardingResult) { $forwardingResult.PcapDropped } else { 0L }
+                                ForwardingInterfaceDropped = if ($null -ne $forwardingResult) { $forwardingResult.InterfaceDropped } else { 0L }
+                                ForwardingStatisticsAvailable = if ($null -ne $forwardingResult) { $forwardingResult.StatisticsAvailable } else { $false }
+                                ForwardingPacketLimitReached = if ($null -ne $forwardingResult) { $forwardingResult.PacketLimitReached } else { $false }
+                                ForwardingCompressedEventsBase64 = if ($null -ne $forwardingResult) {
+                                    [Convert]::ToBase64String($forwardingResult.CompressedEvents)
+                                } else { $null }
+                            }
+                        } finally {
+                            $capture.RequestStop()
+                            if ($null -ne $forwardingCapture) { $forwardingCapture.RequestStop() }
+                            if ($null -ne $captureTask -and -not $captureTask.IsCompleted) {
+                                try { $null = $captureTask.Wait(2000) } catch { }
+                            }
+                            if ($null -ne $forwardingTask -and -not $forwardingTask.IsCompleted) {
+                                try { $null = $forwardingTask.Wait(2000) } catch { }
+                            }
+                            $capture.Dispose()
+                            if ($null -ne $forwardingCapture) { $forwardingCapture.Dispose() }
+                            $global:DnsCoordinatedCaptureSessions.Remove($CaptureId)
+                        }
+                    }
+                    foreach ($state in $captureStates) {
+                        $state.RunJob = Invoke-Command -Session $state.Session -AsJob `
+                            -ScriptBlock $remoteRunScript -ArgumentList @(
+                                $state.Id, $captureDurationSeconds) -ErrorAction Stop
+                        $state.LocalTask = $state.LocalSession.RunAsync($captureDurationSeconds)
+                    }
+                    $runner.ReleaseMeasurementGate()
+                    $captureArmed = $true
+                    $coordinatedCaptureSummary.Status = 'Capturing'
+                }
                 if ($displayTimer.Elapsed.TotalSeconds -ge $DisplayIntervalSeconds) {
                     $live = $runner.GetLiveSnapshot($RollingWindowSeconds)
                     $dashboardParameters.Snapshot = $live
@@ -3956,6 +8132,380 @@ namespace DnsPerformanceV353
             }
             $completion = $runnerTask.GetAwaiter().GetResult()
             $finalSnapshot = $runner.GetFinalSnapshot()
+            if ($CoordinatedCapture) {
+                if (-not $captureArmed) {
+                    throw 'The DNS runner completed without entering the coordinated-capture measurement phase.'
+                }
+                $captureWaitTimer = [Diagnostics.Stopwatch]::StartNew()
+                $captureWaitLimitSeconds = [int][Math]::Ceiling($TimeoutMilliseconds / 1000.0) +
+                    $CaptureGraceSeconds + 30
+                while (@($captureStates | Where-Object {
+                    (-not $_.LocalTask.IsCompleted) -or
+                    ($_.RunJob.State -notin @('Completed','Failed','Stopped'))
+                }).Count -gt 0) {
+                    if ($captureWaitTimer.Elapsed.TotalSeconds -ge $captureWaitLimitSeconds) {
+                        throw "Coordinated capture did not finish within $captureWaitLimitSeconds seconds after the DNS runner completed."
+                    }
+                    Start-Sleep -Milliseconds 100
+                }
+
+                $endpointCaptureSummaries = New-Object 'System.Collections.Generic.List[object]'
+                $captureIssues = New-Object 'System.Collections.Generic.List[string]'
+                $captureFallbacks = New-Object 'System.Collections.Generic.List[string]'
+                $forwardingEndpointSummaries = New-Object 'System.Collections.Generic.List[object]'
+                $forwardingIssues = New-Object 'System.Collections.Generic.List[string]'
+                $forwardingFallbacks = New-Object 'System.Collections.Generic.List[string]'
+                $totalMatchedPairs = 0L
+                foreach ($state in $captureStates) {
+                    $state.ClientResult = $state.LocalTask.GetAwaiter().GetResult()
+                    if ($state.RunJob.State -ne 'Completed') {
+                        $reason = if ($null -ne $state.RunJob.JobStateInfo.Reason) {
+                            $state.RunJob.JobStateInfo.Reason.Message
+                        } else { 'The remote capture job did not complete.' }
+                        throw "Server capture failed on '$($state.RemoteComputer)' for $($state.Label): $reason"
+                    }
+                    $serverOutput = @(Receive-Job -Job $state.RunJob -ErrorAction Stop)
+                    $state.ServerResult = $serverOutput | Where-Object {
+                        $null -ne $_.PSObject.Properties['CompressedPairsBase64']
+                    } | Select-Object -Last 1
+                    if ($null -eq $state.ServerResult) {
+                        throw "Server capture on '$($state.RemoteComputer)' returned no result for $($state.Label)."
+                    }
+                    $remoteCaptureBytes = [Convert]::FromBase64String(
+                        [string]$state.ServerResult.CompressedPairsBase64)
+                    $state.RemoteCaptureBytes = [byte[]]$remoteCaptureBytes
+                    $analysis = [DnsCoordinatedCaptureV424.CaptureAnalyzer]::Analyze(
+                        $state.Label, $state.Address,
+                        [byte[]]$state.ClientResult.CompressedPairs,
+                        $remoteCaptureBytes,
+                        $CaptureSlowTransactionThresholdMilliseconds,
+                        $CaptureMaximumSlowTransactions)
+                    $totalMatchedPairs += [long]$analysis.MatchedPairs
+
+                    $endpointIssues = New-Object 'System.Collections.Generic.List[string]'
+                    if ($state.ClientResult.PacketLimitReached -or $state.ServerResult.PacketLimitReached) {
+                        $endpointIssues.Add('Capture packet safety limit reached.')
+                    }
+                    if (-not $state.ClientResult.StatisticsAvailable -or
+                        -not $state.ServerResult.StatisticsAvailable) {
+                        $endpointIssues.Add('Npcap drop statistics were unavailable at one or both capture points.')
+                    }
+                    if ([long]$state.ClientResult.PcapDropped -gt 0 -or
+                        [long]$state.ClientResult.InterfaceDropped -gt 0) {
+                        $endpointIssues.Add('Client Npcap reported dropped packets.')
+                    }
+                    if ([long]$state.ServerResult.PcapDropped -gt 0 -or
+                        [long]$state.ServerResult.InterfaceDropped -gt 0) {
+                        $endpointIssues.Add('Server Npcap reported dropped packets.')
+                    }
+                    if ([long]$analysis.UnmatchedLocalPairs -gt 0 -or
+                        [long]$analysis.UnmatchedServerPairs -gt 0) {
+                        $endpointIssues.Add('Some completed UDP pairs could not be matched across capture points.')
+                    }
+                    foreach ($issue in $endpointIssues) {
+                        $captureIssues.Add("$($state.Label): $issue")
+                    }
+                    $endpointCaptureSummaries.Add([pscustomobject]@{
+                        DNS_Server             = $state.Label
+                        Address                = $state.Address
+                        CaptureComputer        = $state.RemoteComputer
+                        CaptureMode            = 'Coordinated'
+                        Status                 = if ($endpointIssues.Count -eq 0) { 'Complete' } else { 'Incomplete' }
+                        CoveragePercent        = $analysis.CoveragePercent
+                        MatchedPairs           = $analysis.MatchedPairs
+                        UnmatchedClientPairs   = $analysis.UnmatchedLocalPairs
+                        UnmatchedServerPairs   = $analysis.UnmatchedServerPairs
+                        NegativeNetworkSamples = $analysis.NegativeNetworkRemainders
+                        ClientWire             = $analysis.ClientWire
+                        ClientPacketObservedLatency = $analysis.ClientWire
+                        ServerTurnaround       = $analysis.ServerTurnaround
+                        NetworkRemainder       = $analysis.NetworkRemainder
+                        CombinedNetworkTime    = $analysis.NetworkRemainder
+                        OutboundDelayDelta     = $analysis.OutboundDelayDelta
+                        ReturnDelayDelta       = $analysis.ReturnDelayDelta
+                        DirectionalDeltaMethod = $analysis.DirectionalDeltaMethod
+                        SlowTransactions       = @($analysis.SlowTransactions)
+                        ClientCapture          = Convert-DnsCaptureDiagnostics -Capture $state.ClientResult
+                        ServerCapture          = Convert-DnsCaptureDiagnostics -Capture $state.ServerResult
+                        Issues                 = [string[]]($endpointIssues.ToArray())
+                    })
+
+                    if ($TraceConditionalForwarding) {
+                        if ($state.ForwardingMasterAddresses.Count -eq 0) {
+                            $forwardingEndpointSummaries.Add([pscustomobject]@{
+                                DNS_Server            = $state.Label
+                                Address               = $state.Address
+                                CaptureComputer       = $state.RemoteComputer
+                                Status                = 'NoMatchingCF'
+                                ConditionalForwarders = @()
+                                Analysis              = $null
+                                Capture               = $null
+                                Issues                = @()
+                            })
+                        } elseif (-not [bool]$state.ServerResult.ForwardingEnabled -or
+                            [string]::IsNullOrWhiteSpace(
+                                [string]$state.ServerResult.ForwardingCompressedEventsBase64)) {
+                            $forwardingIssue = 'A matching conditional forwarder was found, but the forwarding capture returned no evidence payload.'
+                            $forwardingIssues.Add("$($state.Label): $forwardingIssue")
+                            $forwardingEndpointSummaries.Add([pscustomobject]@{
+                                DNS_Server            = $state.Label
+                                Address               = $state.Address
+                                CaptureComputer       = $state.RemoteComputer
+                                Status                = 'Incomplete'
+                                ConditionalForwarders = @($state.ConditionalForwarders)
+                                Analysis              = $null
+                                Capture               = $null
+                                Issues                = @($forwardingIssue)
+                            })
+                        } else {
+                            $forwardingBytes = [Convert]::FromBase64String(
+                                [string]$state.ServerResult.ForwardingCompressedEventsBase64)
+                            $forwardingAnalysis =
+                                [DnsForwardingCaptureV410.ForwardingCaptureAnalyzer]::Analyze(
+                                    $state.Label, $state.Address,
+                                    [string[]]($state.ForwardingMasterAddresses),
+                                    [string[]]($state.ForwardingZoneNames),
+                                    [byte[]]$forwardingBytes,
+                                    [datetime]$state.ServerResult.ForwardingCaptureEndUtc,
+                                    $CaptureMaximumForwardingFlights)
+                            $endpointForwardingIssues =
+                                New-Object 'System.Collections.Generic.List[string]'
+                            if ([bool]$state.ServerResult.ForwardingPacketLimitReached) {
+                                $endpointForwardingIssues.Add(
+                                    'Forwarding capture packet safety limit reached.')
+                            }
+                            if (-not [bool]$state.ServerResult.ForwardingStatisticsAvailable) {
+                                $endpointForwardingIssues.Add(
+                                    'Npcap forwarding-capture drop statistics were unavailable.')
+                            }
+                            if ([long]$state.ServerResult.ForwardingPcapDropped -gt 0 -or
+                                [long]$state.ServerResult.ForwardingInterfaceDropped -gt 0) {
+                                $endpointForwardingIssues.Add(
+                                    'Npcap reported dropped forwarding-capture packets.')
+                            }
+                            if ([long]$forwardingAnalysis.UnmatchedForwardResponses -gt 0) {
+                                $endpointForwardingIssues.Add(
+                                    'Some upstream responses could not be matched to an observed upstream query.')
+                            }
+                            foreach ($forwardingIssue in $endpointForwardingIssues) {
+                                $forwardingIssues.Add("$($state.Label): $forwardingIssue")
+                            }
+                            $forwardingEndpointSummaries.Add([pscustomobject]@{
+                                DNS_Server            = $state.Label
+                                Address               = $state.Address
+                                CaptureComputer       = $state.RemoteComputer
+                                Status                = if ($endpointForwardingIssues.Count -eq 0) {
+                                    'Complete'
+                                } else { 'Incomplete' }
+                                ConditionalForwarders = @($state.ConditionalForwarders)
+                                Analysis              = $forwardingAnalysis
+                                Capture               = [pscustomobject]@{
+                                    ComputerName          = $state.ServerResult.ForwardingComputerName
+                                    LocalAddress          = $state.ServerResult.ForwardingLocalAddress
+                                    ClientAddress         = $state.ServerResult.ForwardingClientAddress
+                                    ForwardingLocalAddresses = @($state.ServerResult.ForwardingLocalAddresses)
+                                    MasterAddresses       = @($state.ServerResult.ForwardingMasterAddresses)
+                                    AdapterName           = $state.ServerResult.ForwardingAdapterName
+                                    DeviceName            = $state.ServerResult.ForwardingDeviceName
+                                    Filter                = $state.ServerResult.ForwardingFilter
+                                    NpcapVersion          = $state.ServerResult.ForwardingNpcapVersion
+                                    TimestampSource       = $state.ServerResult.ForwardingTimestampSource
+                                    CaptureStartUtc       = $state.ServerResult.ForwardingCaptureStartUtc
+                                    CaptureEndUtc         = $state.ServerResult.ForwardingCaptureEndUtc
+                                    CapturedPackets       = [long]$state.ServerResult.ForwardingCapturedPackets
+                                    ParsedDnsPackets      = [long]$state.ServerResult.ForwardingParsedDnsPackets
+                                    RelevantEvents        = [long]$state.ServerResult.ForwardingRelevantEvents
+                                    NonDnsOrUnparsedPackets = [long]$state.ServerResult.ForwardingUnparsedDnsPackets
+                                    PcapReceived          = [long]$state.ServerResult.ForwardingPcapReceived
+                                    PcapDropped           = [long]$state.ServerResult.ForwardingPcapDropped
+                                    InterfaceDropped      = [long]$state.ServerResult.ForwardingInterfaceDropped
+                                    StatisticsAvailable   = [bool]$state.ServerResult.ForwardingStatisticsAvailable
+                                    PacketLimitReached    = [bool]$state.ServerResult.ForwardingPacketLimitReached
+                                }
+                                Issues                =
+                                    [string[]]($endpointForwardingIssues.ToArray())
+                            })
+                        }
+                    }
+                    Remove-Job -Job $state.RunJob -Force -ErrorAction SilentlyContinue
+                    $state.RunJob = $null
+                }
+                foreach ($definition in $clientOnlyCaptureDefinitions) {
+                    $fallbackIssue =
+                        'Server-side packet capture unavailable; normal client-side socket timing was retained. ' +
+                        $definition.Reason
+                    $captureFallbacks.Add("$($definition.Label): $fallbackIssue")
+                    $endpointCaptureSummaries.Add([pscustomobject]@{
+                        DNS_Server             = $definition.Label
+                        Address                = $definition.Address
+                        CaptureComputer        = $definition.CaptureComputer
+                        CaptureMode            = 'ClientOnly'
+                        Status                 = 'ClientOnly'
+                        CoveragePercent        = $null
+                        MatchedPairs           = $null
+                        UnmatchedClientPairs   = $null
+                        UnmatchedServerPairs   = $null
+                        NegativeNetworkSamples = $null
+                        ClientWire             = $null
+                        ClientPacketObservedLatency = $null
+                        ServerTurnaround       = $null
+                        NetworkRemainder       = $null
+                        CombinedNetworkTime    = $null
+                        OutboundDelayDelta     = $null
+                        ReturnDelayDelta       = $null
+                        DirectionalDeltaMethod = $null
+                        SlowTransactions       = @()
+                        ClientCapture          = $null
+                        ServerCapture          = $null
+                        Issues                 = @($fallbackIssue)
+                    })
+                    if ($TraceConditionalForwarding) {
+                        $forwardingIssue =
+                            'Server-side conditional-forwarding trace is unavailable because this endpoint is using client-only timing.'
+                        $forwardingFallbacks.Add("$($definition.Label): $forwardingIssue")
+                        $forwardingEndpointSummaries.Add([pscustomobject]@{
+                            DNS_Server            = $definition.Label
+                            Address               = $definition.Address
+                            CaptureComputer       = $definition.CaptureComputer
+                            Status                = 'ClientOnly'
+                            ConditionalForwarders = @()
+                            Analysis              = $null
+                            Capture               = $null
+                            Issues                = @($forwardingIssue)
+                        })
+                    }
+                }
+                if ($resolvedCsvPath) {
+                    try {
+                        $csvCaptureEndpoints =
+                            New-Object 'System.Collections.Generic.List[DnsCoordinatedCaptureV424.CaptureCsvEndpoint]'
+                        foreach ($state in $captureStates) {
+                            $csvCaptureEndpoint =
+                                New-Object DnsCoordinatedCaptureV424.CaptureCsvEndpoint
+                            $csvCaptureEndpoint.ServerAddress = [string]$state.Address
+                            $csvCaptureEndpoint.ClientPairs =
+                                [byte[]]$state.ClientResult.CompressedPairs
+                            $csvCaptureEndpoint.ServerPairs =
+                                [byte[]]$state.RemoteCaptureBytes
+                            $csvCaptureEndpoint.ClientOnly = $false
+                            $csvCaptureEndpoints.Add($csvCaptureEndpoint)
+                        }
+                        foreach ($definition in $clientOnlyCaptureDefinitions) {
+                            $csvCaptureEndpoint =
+                                New-Object DnsCoordinatedCaptureV424.CaptureCsvEndpoint
+                            $csvCaptureEndpoint.ServerAddress =
+                                [string]$definition.Address
+                            $csvCaptureEndpoint.ClientPairs = [byte[]]@()
+                            $csvCaptureEndpoint.ServerPairs = [byte[]]@()
+                            $csvCaptureEndpoint.ClientOnly = $true
+                            $csvCaptureEndpoints.Add($csvCaptureEndpoint)
+                        }
+                        $csvEnrichmentResult =
+                            [DnsCoordinatedCaptureV424.CaptureCsvEnricher]::Enrich(
+                                $resolvedCsvPath, $csvCaptureEndpoints.ToArray())
+                        $csvPacketTimingEnrichment = [pscustomobject]@{
+                            Status                 = 'Complete'
+                            TotalRows              = [long]$csvEnrichmentResult.TotalRows
+                            MatchedRows            = [long]$csvEnrichmentResult.MatchedRows
+                            ClientOnlyRows         = [long]$csvEnrichmentResult.ClientOnlyRows
+                            UnmatchedRows          = [long]$csvEnrichmentResult.UnmatchedRows
+                            NotSentRows            = [long]$csvEnrichmentResult.NotSentRows
+                            TcpFallbackRows        = [long]$csvEnrichmentResult.TcpFallbackRows
+                            DirectionalDeltaMethod = $csvEnrichmentResult.DirectionalDeltaMethod
+                            ErrorMessage           = $null
+                        }
+                    } catch {
+                        $csvEnrichmentMessage =
+                            "Detailed CSV Npcap enrichment failed; the original workload CSV was preserved: $($_.Exception.Message)"
+                        $captureIssues.Add($csvEnrichmentMessage)
+                        Write-Warning $csvEnrichmentMessage
+                        $csvPacketTimingEnrichment = [pscustomobject]@{
+                            Status                 = 'Failed'
+                            TotalRows              = 0L
+                            MatchedRows            = 0L
+                            ClientOnlyRows         = 0L
+                            UnmatchedRows          = 0L
+                            NotSentRows            = 0L
+                            TcpFallbackRows        = 0L
+                            DirectionalDeltaMethod = $null
+                            ErrorMessage           = $_.Exception.Message
+                        }
+                    }
+                }
+                $coordinatedEndpointCount = $captureStates.Count
+                $clientOnlyEndpointCount = $clientOnlyCaptureDefinitions.Count
+                $orderedEndpointCaptureSummaries = [object[]]@(
+                    foreach ($definition in $captureEndpointDefinitions) {
+                        $endpointCaptureSummaries |
+                            Where-Object { $_.Address -eq $definition.Address } |
+                            Select-Object -First 1
+                    }
+                )
+                $incompleteCoordinatedEndpointCount = @(
+                    $orderedEndpointCaptureSummaries |
+                        Where-Object { $_.Status -eq 'Incomplete' }
+                ).Count
+                $coordinatedCaptureSummary = [pscustomobject]@{
+                    Enabled                    = $true
+                    Status                     = if ($incompleteCoordinatedEndpointCount -gt 0) {
+                        'Incomplete'
+                    } elseif ($clientOnlyEndpointCount -gt 0 -and
+                        $coordinatedEndpointCount -gt 0) {
+                        'Mixed'
+                    } elseif ($clientOnlyEndpointCount -gt 0) {
+                        'ClientOnly'
+                    } else { 'Complete' }
+                    Scope                      = 'UDP port 53 request/response pairs; TCP fallbacks are excluded'
+                    TimestampSource            = 'Npcap default host timestamp (microsecond representation)'
+                    ClockSynchronizationNeeded = $false
+                    DirectionalClockRequirement = 'Clock offset need not be zero, but it must remain stable within the nearby baseline window'
+                    DirectionalDeltaMethod      = 'Same-endpoint actual P10 combined-network transaction in a nearby approximately 11-second window; deltas are not absolute one-way latency'
+                    TcpFallbackPairsExcluded   = [long]$finalSnapshot.Overall.TcpFallback
+                    MatchedPairs               = $totalMatchedPairs
+                    CoordinatedEndpointCount   = $coordinatedEndpointCount
+                    ClientOnlyEndpointCount    = $clientOnlyEndpointCount
+                    CsvEnrichment              = $csvPacketTimingEnrichment
+                    Endpoints                  = $orderedEndpointCaptureSummaries
+                    Fallbacks                  = [string[]]($captureFallbacks.ToArray())
+                    Issues                     = [string[]]($captureIssues.ToArray())
+                }
+                if ($TraceConditionalForwarding) {
+                    $orderedForwardingEndpointSummaries = [object[]]@(
+                        foreach ($definition in $captureEndpointDefinitions) {
+                            $forwardingEndpointSummaries |
+                                Where-Object { $_.Address -eq $definition.Address } |
+                                Select-Object -First 1
+                        }
+                    )
+                    $matchingEndpointCount = @($orderedForwardingEndpointSummaries |
+                        Where-Object { $_.Status -notin @(
+                            'NoMatchingCF','ClientOnly') }).Count
+                    $clientOnlyForwardingCount = @($orderedForwardingEndpointSummaries |
+                        Where-Object { $_.Status -eq 'ClientOnly' }).Count
+                    $incompleteForwardingCount = @($orderedForwardingEndpointSummaries |
+                        Where-Object { $_.Status -eq 'Incomplete' }).Count
+                    $conditionalForwardingSummary = [pscustomobject]@{
+                        Enabled                     = $true
+                        Status                      = if ($incompleteForwardingCount -gt 0) {
+                            'Incomplete'
+                        } elseif ($clientOnlyForwardingCount -gt 0 -and
+                            $matchingEndpointCount -gt 0) {
+                            'Mixed'
+                        } elseif ($clientOnlyForwardingCount -gt 0) {
+                            'ClientOnly'
+                        } elseif ($matchingEndpointCount -eq 0) {
+                            'NoMatchingCF'
+                        } else { 'Complete' }
+                        Scope                       = 'Exact tested DNS questions on client-facing and conditional-forwarder paths; CNAME-derived child lookups are outside this trace'
+                        CacheMutation               = 'None; cached answers can legitimately have no observed forwarding flight'
+                        Endpoints                   = $orderedForwardingEndpointSummaries
+                        Fallbacks                   = [string[]]($forwardingFallbacks.ToArray())
+                        Issues                      = [string[]]($forwardingIssues.ToArray())
+                    }
+                }
+            }
+        } catch {
+            $executionError = $_
         } finally {
             if ($null -ne $runnerTask -and -not $runnerTask.IsCompleted) {
                 $cancellation.Cancel()
@@ -3963,6 +8513,46 @@ namespace DnsPerformanceV353
             }
             $cancellation.Dispose()
             if ($null -ne $runner) { $runner.Dispose() }
+            foreach ($state in $captureStates) {
+                if ($null -ne $state.LocalSession) {
+                    try { $state.LocalSession.RequestStop() } catch { }
+                    if ($null -ne $state.LocalTask -and -not $state.LocalTask.IsCompleted) {
+                        try { $null = $state.LocalTask.Wait(2000) } catch { }
+                    }
+                    try { $state.LocalSession.Dispose() } catch { }
+                }
+                foreach ($job in @($state.OpenJob, $state.RunJob)) {
+                    if ($null -eq $job) { continue }
+                    if ($job.State -notin @('Completed','Failed','Stopped')) {
+                        Stop-Job -Job $job -ErrorAction SilentlyContinue
+                    }
+                    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                }
+                if ($null -ne $state.Session) {
+                    try {
+                        $null = Invoke-Command -Session $state.Session -ArgumentList $state.Id `
+                            -ErrorAction SilentlyContinue -ScriptBlock {
+                                param($CaptureId)
+                                if ($null -ne $global:DnsCoordinatedCaptureSessions -and
+                                    $global:DnsCoordinatedCaptureSessions.ContainsKey($CaptureId)) {
+                                    $entry = $global:DnsCoordinatedCaptureSessions[$CaptureId]
+                                    foreach ($capture in @(
+                                        $entry.PairCapture, $entry.ForwardingCapture)) {
+                                        if ($null -eq $capture) { continue }
+                                        $capture.RequestStop()
+                                        $capture.Dispose()
+                                    }
+                                    $global:DnsCoordinatedCaptureSessions.Remove($CaptureId)
+                                }
+                            }
+                    } catch { }
+                    Remove-PSSession -Session $state.Session -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        if ($null -ne $executionError) {
+            $PSCmdlet.ThrowTerminatingError($executionError)
         }
 
         if ($null -eq $completion -or $null -eq $finalSnapshot -or $null -eq $finalSnapshot.Overall) {
@@ -4146,6 +8736,23 @@ namespace DnsPerformanceV353
                 SchedulingMode                  = 'PairedRoundRobin'
                 PercentileMethod                = 'Bounded histogram; 0.01 ms bins below 10 ms'
                 LatencyDefinition               = 'Socket-observed: UDP send-to-Socket.Receive return; TCP send-to-final-read completion'
+                CoordinatedCapture              = [pscustomobject]@{
+                    Enabled                     = [bool]$CoordinatedCapture
+                    CaptureComputerMap          = $CaptureComputerMap
+                    UseSSL                      = [bool]$CaptureUseSSL
+                    StartupTimeoutSeconds       = $CaptureStartupTimeoutSeconds
+                    GraceSeconds                = $CaptureGraceSeconds
+                    MaximumPacketsPerEndpoint   = $CaptureMaximumPacketsPerEndpoint
+                    SlowTransactionThresholdMs  = $CaptureSlowTransactionThresholdMilliseconds
+                    MaximumSlowTransactions     = $CaptureMaximumSlowTransactions
+                }
+                ConditionalForwarding            = [pscustomobject]@{
+                    Enabled                     = [bool]$TraceConditionalForwarding
+                    MaximumPacketsPerEndpoint   = $CaptureMaximumForwardingPacketsPerEndpoint
+                    MaximumRetainedFlights      = $CaptureMaximumForwardingFlights
+                    CacheMutation               = 'None'
+                    MultiAdapterEgressSupported = $false
+                }
                 DegradationAnalysis             = [pscustomobject]@{
                     WindowSeconds               = $DegradationWindowSeconds
                     EvaluationStepSeconds        = 1
@@ -4190,6 +8797,8 @@ namespace DnsPerformanceV353
             TotalDegradationIncidents = $finalSnapshot.TotalDegradationIncidents
             OmittedDegradationIncidents = $finalSnapshot.OmittedDegradationIncidents
             LargestSuccessfulObservation = $largestObservation
+            CoordinatedCapture   = $coordinatedCaptureSummary
+            ConditionalForwarding = $conditionalForwardingSummary
             ObserverHealth       = [pscustomobject]@{
                 WarmupSeconds             = $finalSnapshot.Observer.WarmupSeconds
                 ParserWorkerCount         = $finalSnapshot.Observer.ParserWorkerCount
