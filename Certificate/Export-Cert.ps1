@@ -41,7 +41,7 @@ Function Export-Cert {
 
         [Parameter(Mandatory=$false, Position = 3)]
         [String]
-        $Password = 'abc123'
+        $Password
     )
 
     # If the ChildPath contains 'Root', exit the function
