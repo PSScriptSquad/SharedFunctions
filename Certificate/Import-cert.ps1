@@ -25,7 +25,7 @@ Function Import-cert {
     #>
     param(
         [Parameter(Mandatory=$false,Position=0)]
-        [String]$Password = 'abc123'
+        [String]$Password
     )
 
     # Convert password to secure string
