@@ -1,7 +1,7 @@
 ﻿# Create containers for each test file with their specific parameters
 $containers = @(
     New-PesterContainer -Path "C:\TEMP\Get-Events\Get-Events.Integration.Tests.ps1"  -Data @{
-        RemoteTestComputer = <Server>
+        RemoteTestComputer = "dc01.example.com"
         TestLogName = 'Security'
     }   
 )
