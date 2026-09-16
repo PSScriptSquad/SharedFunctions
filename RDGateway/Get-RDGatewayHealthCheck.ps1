@@ -34,7 +34,7 @@ function Get-RDGatewayHealthCheck {
 
         .NOTES
             Ensure that the account used has the necessary permissions to access the RD Gateway server.
-            F5 equivalent: RPC_IN_DATA /rpc/en-us/rpcproxy.dll HTTP/1.1\r\nHost: RDWGW.sb.gcps5.gwin
+            F5 equivalent: RPC_IN_DATA /rpc/en-us/rpcproxy.dll HTTP/1.1\r\nHost: rdgw.example.com
 
             Name: Get-RDGatewayHealthCheck 
             Author: Ryan Whitlock
